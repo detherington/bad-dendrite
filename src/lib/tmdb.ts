@@ -18,6 +18,12 @@ import {
   type SaDiagnostics,
   type SaFetchResult,
 } from "./streaming-availability";
+import { runAllScrapers } from "./scrapers";
+import type {
+  ScrapedRelease,
+  ScraperDiagnostic,
+  ScraperResult,
+} from "./scrapers/types";
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 
@@ -767,6 +773,63 @@ export async function searchTvByName(
   }
 }
 
+/** Search TMDB for a movie by name. Same semantics as `searchTvByName`
+ *  but against the /search/movie endpoint. */
+export async function searchMovieByName(
+  query: string,
+  year?: number,
+): Promise<TmdbDiscoverItem | null> {
+  const params: Record<string, string | number> = {
+    query,
+    language: "en-US",
+    include_adult: "false",
+    page: 1,
+  };
+  if (year && Number.isFinite(year)) {
+    params.primary_release_year = year;
+  }
+  try {
+    const res = await tmdbFetch<{ results: TmdbDiscoverItem[] }>("/search/movie", {
+      params,
+    });
+    if (!res.results || res.results.length === 0) return null;
+    const normalized = normalizeTitle(query);
+    const top = res.results.slice(0, 5);
+    const exact = top.find(
+      (r) => normalizeTitle(r.title ?? r.name ?? "") === normalized,
+    );
+    return exact ?? top[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Dispatch a TMDB search based on a media-type hint from a scraper.
+ *  When the hint is "unknown" we try movie first (the streamer press
+ *  pages are more movie-heavy) then fall back to TV. */
+export async function searchByName(
+  query: string,
+  year: number | undefined,
+  hint: "movie" | "tv" | "unknown",
+): Promise<{ mediaType: "movie" | "tv"; item: TmdbDiscoverItem } | null> {
+  if (hint === "movie") {
+    const m = await searchMovieByName(query, year);
+    if (m) return { mediaType: "movie", item: m };
+    const t = await searchTvByName(query, year);
+    return t ? { mediaType: "tv", item: t } : null;
+  }
+  if (hint === "tv") {
+    const t = await searchTvByName(query, year);
+    if (t) return { mediaType: "tv", item: t };
+    const m = await searchMovieByName(query, year);
+    return m ? { mediaType: "movie", item: m } : null;
+  }
+  const m = await searchMovieByName(query, year);
+  if (m) return { mediaType: "movie", item: m };
+  const t = await searchTvByName(query, year);
+  return t ? { mediaType: "tv", item: t } : null;
+}
+
 async function fetchSeasonVideos(
   tvId: number,
   seasonNumber: number,
@@ -820,6 +883,18 @@ export interface ReleaseSourceDiagnostics {
     episodes: number;
   };
   streamingAvailability: SaDiagnostics;
+  scrapers: {
+    perSource: ScraperDiagnostic[];
+    injection: {
+      attempted: number;
+      resolved: number;
+      matchedExisting: number;
+      addedNew: number;
+      unresolved: number;
+      droppedOutsideWindow: number;
+    };
+    resolvedBySource: Record<string, number>;
+  };
   releaseLoop: {
     entered: number;
     droppedDetailFailed: number;
@@ -1044,7 +1119,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     releaseDatesInPast: 0,
     sampleItems: [],
   };
-  const [discoverResults, tvmazeEpisodes, saResult] = await Promise.all([
+  const [discoverResults, tvmazeEpisodes, saResult, scraperResult] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),
     includeTv
       ? fetchTvmazeWebSchedule(from, to, region).catch(() => [] as TvmazeEpisode[])
@@ -1060,9 +1135,30 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         },
       }),
     ),
+    runAllScrapers().catch(
+      (err): ScraperResult => ({
+        releases: [],
+        diagnostics: [
+          {
+            source: "runAllScrapers",
+            providerId: 0,
+            url: "",
+            fetched: false,
+            httpStatus: null,
+            itemsFound: 0,
+            error: err instanceof Error ? err.message : String(err),
+            samples: [],
+            parseStrategy: null,
+            htmlBytes: 0,
+          },
+        ],
+      }),
+    ),
   ]);
   const saResults = saResult.items;
   const saDiagnostics = saResult.diagnostics;
+  const scrapedReleases = scraperResult.releases;
+  const scraperDiagnostics = scraperResult.diagnostics;
 
   // Track which allowed providers each candidate was discovered under. If
   // TMDB's watch/providers detail response later comes back empty for the
@@ -1152,6 +1248,83 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         verifiedOriginal: true,
         saReleaseDate: sa.releaseDate,
       });
+    }
+  }
+
+  // --- Phase 1a'': Scraper injection --------------------------------------
+  // Results from the per-streamer press/editorial scrapers (Netflix
+  // Tudum, Disney+ press, Max press, Apple TV+ coming-soon, Prime Video
+  // press, Peacock, Hulu press). Each scraped release has a title and
+  // a scheduled release date from an authoritative source. We resolve
+  // each title to a TMDB id via /search/{movie|tv} (cached 6h at the
+  // fetch layer) and inject as a verifiedOriginal candidate with the
+  // scraper's date as `saReleaseDate` (which the movie branch of the
+  // release-building loop uses as its primary date source).
+  //
+  // Budget: the scraper search step is capped and concurrency-limited
+  // to avoid spending the whole cold-fetch window on TMDB search calls.
+  const scraperSearchCountsBySource = new Map<string, number>();
+  const scraperInjectionStats = {
+    attempted: 0,
+    resolved: 0,
+    matchedExisting: 0,
+    addedNew: 0,
+    unresolved: 0,
+    droppedOutsideWindow: 0,
+  };
+
+  if (scrapedReleases.length > 0) {
+    // Drop scraped releases whose date is already outside the window —
+    // no point paying for a TMDB search we'd throw away downstream.
+    const inWindow = scrapedReleases.filter(
+      (s) => s.releaseDate >= from && s.releaseDate <= to,
+    );
+    scraperInjectionStats.droppedOutsideWindow =
+      scrapedReleases.length - inWindow.length;
+
+    // Cap and run the TMDB searches with bounded concurrency.
+    const SCRAPER_SEARCH_CAP = 300;
+    const toSearch = inWindow.slice(0, SCRAPER_SEARCH_CAP);
+    scraperInjectionStats.attempted = toSearch.length;
+
+    const searchResults = await runWithConcurrency(toSearch, 8, (s) =>
+      searchByName(s.title, s.year, s.mediaType),
+    );
+
+    for (let i = 0; i < toSearch.length; i++) {
+      const scraped = toSearch[i];
+      const searchRes = searchResults[i];
+      if (searchRes.status !== "fulfilled" || searchRes.value == null) {
+        scraperInjectionStats.unresolved++;
+        continue;
+      }
+      scraperInjectionStats.resolved++;
+      scraperSearchCountsBySource.set(
+        scraped.source,
+        (scraperSearchCountsBySource.get(scraped.source) ?? 0) + 1,
+      );
+      const { mediaType: resolvedMediaType, item: resolvedItem } = searchRes.value;
+      const key = `${resolvedMediaType}-${resolvedItem.id}`;
+      const existing = candidatesByKey.get(key);
+      if (existing) {
+        existing.verifiedOriginal = true;
+        existing.discoveredFrom.add(scraped.providerId);
+        // Prefer the scraped date as authoritative for movies — press
+        // sites publish the actual streamer release date.
+        if (!existing.saReleaseDate) {
+          existing.saReleaseDate = scraped.releaseDate;
+        }
+        scraperInjectionStats.matchedExisting++;
+      } else {
+        candidatesByKey.set(key, {
+          mediaType: resolvedMediaType,
+          item: resolvedItem,
+          discoveredFrom: new Set([scraped.providerId]),
+          verifiedOriginal: true,
+          saReleaseDate: scraped.releaseDate,
+        });
+        scraperInjectionStats.addedNew++;
+      }
     }
   }
 
@@ -1509,6 +1682,11 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       episodes: tvmazeEpisodes.length,
     },
     streamingAvailability: saDiagnostics,
+    scrapers: {
+      perSource: scraperDiagnostics,
+      injection: scraperInjectionStats,
+      resolvedBySource: Object.fromEntries(scraperSearchCountsBySource),
+    },
     releaseLoop: loopCounts,
     releasesAfterOriginalityFilter: releases.length,
     releasesAfterDateClamp: deduped.length,
