@@ -309,15 +309,28 @@ function computeStarPower(cast: TmdbCastEntry[] | undefined): number {
 }
 
 /** Pick the display date for a movie from TMDB's regional release_dates.
- *  ONLY returns Digital (type 4) or TV (type 6) release dates — this is a
- *  streaming-releases app, so theatrical dates (types 2 and 3) are
- *  treated as "movie is in cinemas, not yet streaming" and get dropped.
+ *  Prefers Digital (type 4) / TV (type 6) release dates in window.
+ *  Falls back to the primary release_date field in window.
+ *
+ *  `trustPrimary` controls whether the primary fallback is allowed when
+ *  the movie has any theatrical release (type 2 or 3) in its release_dates:
+ *    - `false` (default): strict. Primary fallback only fires when the
+ *      movie has NO theatrical entries anywhere. This excludes
+ *      theatrical-first licensed films whose primary field equals
+ *      their cinema date.
+ *    - `true` (for verified-original candidates): trust the primary
+ *      date whenever it's in window. Netflix / Max / Disney+ originals
+ *      frequently have Oscar-qualifying theatrical entries that would
+ *      otherwise block the fallback even though the movie is clearly
+ *      the streamer's own production.
+ *
  *  Returns null to signal "drop this item". */
 function pickMovieReleaseDate(
   details: TmdbDetails,
   region: string,
   from: string,
   to: string,
+  trustPrimary: boolean = false,
 ): string | null {
   const regional = details.release_dates?.results?.find(
     (r) => r.iso_3166_1 === region,
@@ -334,19 +347,13 @@ function pickMovieReleaseDate(
     if (streamingInWindow.length > 0) return streamingInWindow[0].date;
   }
 
-  // Fall back to primary (worldwide earliest) release date, but ONLY if:
-  //   1. It's inside the window, AND
-  //   2. The movie has NO theatrical release anywhere in its release_dates
-  //      (type 2 or 3). That preserves true streaming-first originals
-  //      whose primary field equals their digital drop date, while
-  //      excluding theatrical-first movies whose primary field equals
-  //      their cinema date.
-  const hasAnyTheatrical = details.release_dates?.results?.some((r) =>
-    r.release_dates?.some((rd) => rd.type === 2 || rd.type === 3),
-  );
-  if (!hasAnyTheatrical) {
-    const primary = (details.release_date || "").slice(0, 10);
-    if (primary && primary >= from && primary <= to) return primary;
+  const primary = (details.release_date || "").slice(0, 10);
+  if (primary && primary >= from && primary <= to) {
+    if (trustPrimary) return primary;
+    const hasAnyTheatrical = details.release_dates?.results?.some((r) =>
+      r.release_dates?.some((rd) => rd.type === 2 || rd.type === 3),
+    );
+    if (!hasAnyTheatrical) return primary;
   }
 
   return null;
@@ -1337,16 +1344,24 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     let highlightLabel: string | null = null;
 
     if (mediaType === "movie") {
-      // Prefer Streaming Availability's per-catalog timestamp when we
-      // have one — it's the most reliable "arrives on X on date Y"
-      // signal for upcoming originals. Fall back to TMDB regional
-      // release_dates (digital/TV only) for non-SA candidates and for
-      // SA items whose hint is outside the window.
+      // Prefer Streaming Availability's per-catalog timestamp when it's
+      // actually in window. In practice SA's /changes endpoint returns
+      // currently-available catalog items (past `availableSince`), so
+      // this branch rarely fires — the main movie date comes from TMDB.
       const saDate = candidate.saReleaseDate;
       if (saDate && saDate >= from && saDate <= to) {
         releaseDate = saDate;
       } else {
-        releaseDate = pickMovieReleaseDate(d, region, from, to) ?? undefined;
+        // For verified-original candidates, allow the primary release
+        // date fallback even when the movie has theatrical entries
+        // (Netflix Oscar-run titles, Max WB-theatrical-owned content,
+        // Disney+ theatrical-tagged content -- all rightfully originals
+        // in our model). For unverified candidates keep the strict
+        // "no theatrical anywhere" rule to reject licensed theatrical
+        // releases.
+        releaseDate =
+          pickMovieReleaseDate(d, region, from, to, candidate.verifiedOriginal) ??
+          undefined;
       }
       highlightKind = "movie-release";
       highlightLabel = "New Movie";
