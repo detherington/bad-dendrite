@@ -1305,18 +1305,26 @@ export async function fetchUpcomingReleasesWithDiagnostics(
   // --- Phase 1a.5: Watchmode injection ------------------------------------
   // Watchmode's /releases/ endpoint is purpose-built for "upcoming
   // streaming releases per service" and returns TMDB ids plus actual
-  // streamer release dates directly -- no title search required. We
-  // inject matches exactly like SA but flip `verifiedOriginal` based
-  // on Watchmode's own `is_original` flag (when 1, the title is marked
-  // as a service original so it skips the production_companies filter;
-  // otherwise it flows through the normal originality gate).
+  // streamer release dates directly -- no title search required.
+  //
+  // Every Watchmode match is injected as `verifiedOriginal: true`. The
+  // reasoning: the /releases/ feed is a curated upcoming-schedule, not
+  // a catalog-additions feed, so by definition every entry is "coming
+  // to this service on this date" — which is exactly what the user
+  // wants to see. We deliberately do NOT gate on Watchmode's own
+  // `is_original` flag because in practice it's very conservative
+  // (only ~30% of entries in a typical refresh are flagged, missing
+  // many true originals) and our downstream `production_companies`
+  // filter is too strict to fill the gap on its own. Trusting the
+  // feed unconditionally is what closes the Netflix-movie coverage
+  // gap that motivated adding Watchmode in the first place.
   if (watchmodeResults.length > 0) {
     for (const wm of watchmodeResults) {
       const key = `${wm.mediaType}-${wm.tmdbId}`;
       const existing = candidatesByKey.get(key);
       if (existing) {
         for (const pid of wm.providerIds) existing.discoveredFrom.add(pid);
-        if (wm.isOriginal) existing.verifiedOriginal = true;
+        existing.verifiedOriginal = true;
         if (wm.releaseDate && !existing.saReleaseDate) {
           existing.saReleaseDate = wm.releaseDate;
         }
@@ -1335,7 +1343,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         mediaType: wm.mediaType,
         item: stubItem,
         discoveredFrom: new Set(wm.providerIds),
-        verifiedOriginal: wm.isOriginal,
+        verifiedOriginal: true,
         saReleaseDate: wm.releaseDate,
       });
     }
@@ -1607,10 +1615,11 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     let highlightLabel: string | null = null;
 
     if (mediaType === "movie") {
-      // Prefer Streaming Availability's per-catalog timestamp when it's
-      // actually in window. In practice SA's /changes endpoint returns
-      // currently-available catalog items (past `availableSince`), so
-      // this branch rarely fires — the main movie date comes from TMDB.
+      // Prefer the injected `saReleaseDate` when it's in window. This
+      // is populated by Watchmode (authoritative), Streaming
+      // Availability, or a scraper -- each of which tracks the actual
+      // streamer release schedule better than TMDB's crowdsourced
+      // release_dates. Fall through to pickMovieReleaseDate otherwise.
       const saDate = candidate.saReleaseDate;
       if (saDate && saDate >= from && saDate <= to) {
         releaseDate = saDate;
@@ -1630,7 +1639,60 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       highlightLabel = "New Movie";
     } else {
       const nextEp = d.next_episode_to_air;
-      if (nextEp?.air_date) {
+      const saDate = candidate.saReleaseDate;
+      // An in-window saReleaseDate from SA/Watchmode/scrapers is a
+      // stronger signal than TMDB's next_episode_to_air when they
+      // disagree, because those sources track the actual streamer
+      // release schedule — TMDB's next_episode_to_air often lags for
+      // upcoming seasons (set to the currently-airing season's next
+      // episode, or null entirely when a new season hasn't been
+      // entered yet). Prefer the TMDB schedule only when it points
+      // to a premiere (E1) that's already in window; otherwise fall
+      // back to saReleaseDate as a Season N Premiere.
+      const nextEpAirDate =
+        nextEp?.air_date != null ? nextEp.air_date : null;
+      const nextEpInWindow =
+        nextEpAirDate != null && nextEpAirDate >= from && nextEpAirDate <= to;
+      const saInWindow = saDate != null && saDate >= from && saDate <= to;
+
+      if (nextEpInWindow && nextEp && nextEpAirDate) {
+        releaseDate = nextEpAirDate;
+        if (nextEp.episode_number === 1 && nextEp.season_number === 1) {
+          highlightKind = "series-premiere";
+          highlightLabel = "Series Premiere";
+          title = `${baseTitle} \u2014 Series Premiere`;
+        } else if (nextEp.episode_number === 1) {
+          highlightKind = "season-premiere";
+          highlightLabel = `Season ${nextEp.season_number} Premiere`;
+          title = `${baseTitle} \u2014 Season ${nextEp.season_number} Premiere`;
+        } else {
+          highlightKind = "episode";
+          highlightLabel = null;
+          title = `${baseTitle} \u2014 S${nextEp.season_number} \u00b7 E${nextEp.episode_number}`;
+        }
+      } else if (saInWindow && saDate) {
+        // Watchmode / SA / scraper date: we don't know the exact
+        // season number, so label as a generic season premiere. For
+        // brand-new series with no prior aired seasons, the TMDB
+        // first_air_date may equal saDate in which case it's really a
+        // series premiere — we can't always tell them apart here, so
+        // use "Season Premiere" as the conservative label.
+        releaseDate = saDate;
+        const firstAir = d.first_air_date || item.first_air_date;
+        const isBrandNew =
+          !firstAir || firstAir >= from || firstAir === saDate;
+        if (isBrandNew) {
+          highlightKind = "series-premiere";
+          highlightLabel = "Series Premiere";
+          title = `${baseTitle} \u2014 Series Premiere`;
+        } else {
+          highlightKind = "season-premiere";
+          highlightLabel = "Season Premiere";
+          title = `${baseTitle} \u2014 Season Premiere`;
+        }
+      } else if (nextEp?.air_date) {
+        // Out-of-window TMDB schedule — use it anyway; the window
+        // clamp below will drop it if truly out of range.
         releaseDate = nextEp.air_date;
         if (nextEp.episode_number === 1 && nextEp.season_number === 1) {
           highlightKind = "series-premiere";
