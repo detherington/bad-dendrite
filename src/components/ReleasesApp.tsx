@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { MediaType, Release, ReleasesResponse } from "@/lib/types";
 import { ListView } from "./ListView";
 import { CalendarView } from "./CalendarView";
@@ -12,6 +12,33 @@ type ViewMode = "list" | "calendar";
 
 interface Props {
   initial: ReleasesResponse;
+  /** Optional release id from the `?r=` query param. When present the
+   *  matching release is opened as a modal on mount, so shared links
+   *  land directly on the record. */
+  initialSelectedId?: string;
+}
+
+/** Read the `r` query param from the current URL. Safe on the server
+ *  (returns null) thanks to the typeof guard. */
+function readSelectedIdFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URL(window.location.href).searchParams.get("r");
+}
+
+/** Update the URL so it matches the currently selected release.
+ *  Uses replaceState so we don't spam the browser history when the
+ *  user scrolls through several releases in a row. */
+function syncSelectedToUrl(id: string | null) {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  const current = url.searchParams.get("r");
+  if (id === current) return;
+  if (id) {
+    url.searchParams.set("r", id);
+  } else {
+    url.searchParams.delete("r");
+  }
+  window.history.replaceState(null, "", url.toString());
 }
 
 function defaultFilters(releases: Release[]): FilterState {
@@ -33,10 +60,37 @@ function collectProviders(releases: Release[]) {
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function ReleasesApp({ initial }: Props) {
+export function ReleasesApp({ initial, initialSelectedId }: Props) {
   const [view, setView] = useState<ViewMode>("list");
   const [filters, setFilters] = useState<FilterState>(() => defaultFilters(initial.releases));
-  const [selected, setSelected] = useState<Release | null>(null);
+  const [selected, setSelected] = useState<Release | null>(() => {
+    if (!initialSelectedId) return null;
+    return initial.releases.find((r) => r.id === initialSelectedId) ?? null;
+  });
+
+  // Keep the URL in sync with the selection so the current view is
+  // always shareable. Runs only when `selected.id` actually changes.
+  useEffect(() => {
+    syncSelectedToUrl(selected?.id ?? null);
+  }, [selected]);
+
+  // Respond to history navigation (back/forward buttons, or another
+  // tab/link updating the URL) by re-reading the `r` param.
+  useEffect(() => {
+    function onPopState() {
+      const id = readSelectedIdFromUrl();
+      if (!id) {
+        setSelected(null);
+        return;
+      }
+      const match = initial.releases.find((r) => r.id === id);
+      if (match) setSelected(match);
+    }
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [initial.releases]);
+
+  const handleClose = useCallback(() => setSelected(null), []);
 
   const filtered = useMemo(() => {
     return initial.releases.filter((r) => {
@@ -92,7 +146,7 @@ export function ReleasesApp({ initial }: Props) {
         )}
       </div>
 
-      {selected && <ReleaseDetailModal release={selected} onClose={() => setSelected(null)} />}
+      {selected && <ReleaseDetailModal release={selected} onClose={handleClose} />}
 
       <footer className="mt-12 border-t border-ink-800 pt-6 text-xs text-ink-400">
         Data provided by{" "}

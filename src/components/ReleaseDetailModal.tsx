@@ -1,12 +1,22 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { Release } from "@/lib/types";
 import { tmdbImage } from "@/lib/tmdb-client";
 
 interface Props {
   release: Release;
   onClose: () => void;
+}
+
+/** Build the canonical shareable URL for a release based on the current
+ *  origin + path. We don't trust window.location.search since the user
+ *  might have extra UI state in the query string someday. */
+function buildShareUrl(releaseId: string): string {
+  if (typeof window === "undefined") return "";
+  const url = new URL(window.location.href);
+  url.searchParams.set("r", releaseId);
+  return url.toString();
 }
 
 function formatFullDate(iso: string): string {
@@ -19,6 +29,40 @@ function formatFullDate(iso: string): string {
 }
 
 export function ReleaseDetailModal({ release, onClose }: Props) {
+  const [shareState, setShareState] = useState<"idle" | "copied" | "error">("idle");
+
+  // Reset the Share button feedback whenever a different release is shown.
+  useEffect(() => {
+    setShareState("idle");
+  }, [release.id]);
+
+  async function handleShare() {
+    const url = buildShareUrl(release.id);
+    if (!url) return;
+
+    // Prefer the native share sheet on mobile / supported desktops.
+    const nav = typeof navigator !== "undefined" ? navigator : null;
+    if (nav && typeof nav.share === "function") {
+      try {
+        await nav.share({ title: release.baseTitle, url });
+        return;
+      } catch (err) {
+        // User cancelled the share sheet — not an error, just fall back
+        // to clipboard so desktop users get "Copied!" feedback.
+        if ((err as Error | null)?.name === "AbortError") return;
+      }
+    }
+
+    try {
+      await nav?.clipboard?.writeText(url);
+      setShareState("copied");
+      window.setTimeout(() => setShareState("idle"), 2000);
+    } catch {
+      setShareState("error");
+      window.setTimeout(() => setShareState("idle"), 2500);
+    }
+  }
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -155,6 +199,32 @@ export function ReleaseDetailModal({ release, onClose }: Props) {
                   Watch trailer
                 </a>
               )}
+              <button
+                type="button"
+                onClick={handleShare}
+                className="inline-flex items-center gap-1.5 rounded-md border border-ink-600 bg-ink-900 px-3 py-1.5 text-sm text-ink-100 hover:bg-ink-800 disabled:opacity-60"
+                aria-label="Share link to this release"
+              >
+                <svg
+                  className="h-3.5 w-3.5"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7" />
+                  <polyline points="16 6 12 2 8 6" />
+                  <line x1="12" y1="2" x2="12" y2="15" />
+                </svg>
+                {shareState === "copied"
+                  ? "Link copied"
+                  : shareState === "error"
+                    ? "Copy failed"
+                    : "Share"}
+              </button>
               <a
                 href={release.tmdbUrl}
                 target="_blank"

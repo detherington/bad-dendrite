@@ -27,8 +27,14 @@ async function loadReleases(): Promise<
   }
 }
 
-export default async function Page() {
+export default async function Page({
+  searchParams,
+}: {
+  searchParams?: { r?: string | string[] };
+}) {
   const result = await loadReleases();
+  const rawR = searchParams?.r;
+  const initialSelectedId = Array.isArray(rawR) ? rawR[0] : rawR;
 
   if (!result.ok) {
     return (
@@ -72,7 +78,7 @@ export default async function Page() {
 
   return (
     <Suspense>
-      <ReleasesApp initial={result.data} />
+      <ReleasesApp initial={result.data} initialSelectedId={initialSelectedId} />
     </Suspense>
   );
 }
