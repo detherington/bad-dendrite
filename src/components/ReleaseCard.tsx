@@ -17,7 +17,7 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
     <button
       type="button"
       onClick={onClick}
-      className="group flex w-full gap-4 rounded-xl border border-ink-800 bg-ink-900/60 p-3 text-left transition hover:border-ink-600 hover:bg-ink-800/60"
+      className="group flex w-full min-w-0 gap-4 overflow-hidden rounded-xl border border-ink-800 bg-ink-900/60 p-3 text-left transition hover:border-ink-600 hover:bg-ink-800/60"
     >
       <div className="relative h-[132px] w-[88px] shrink-0 overflow-hidden rounded-md bg-ink-800">
         {poster ? (
@@ -36,11 +36,13 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
       </div>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex flex-wrap items-center gap-2">
-          <h3 className="truncate text-base font-semibold text-ink-50">{release.title}</h3>
+        <div className="flex min-w-0 items-center gap-2">
+          <h3 className="min-w-0 flex-1 truncate text-base font-semibold text-ink-50">
+            {release.title}
+          </h3>
           <MediaBadge type={release.mediaType} />
           {release.voteAverage > 0 && (
-            <span className="rounded-full bg-amber-400/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+            <span className="shrink-0 rounded-full bg-amber-400/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
               &#9733; {release.voteAverage.toFixed(1)}
             </span>
           )}
@@ -58,7 +60,7 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
         )}
 
         {!compact && release.overview && (
-          <p className="mt-2 line-clamp-2 text-xs text-ink-300">{release.overview}</p>
+          <p className="mt-2 line-clamp-2 break-words text-xs text-ink-300">{release.overview}</p>
         )}
 
         <div className="mt-auto flex flex-wrap items-center gap-1.5 pt-2">
@@ -68,7 +70,7 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
               <span
                 key={p.id}
                 title={p.name}
-                className="flex h-6 w-6 items-center justify-center overflow-hidden rounded bg-ink-800 ring-1 ring-ink-700"
+                className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded bg-ink-800 ring-1 ring-ink-700"
               >
                 {logo ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -80,7 +82,7 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
             );
           })}
           {release.streamingProviders.length > 6 && (
-            <span className="text-[11px] text-ink-400">+{release.streamingProviders.length - 6}</span>
+            <span className="shrink-0 text-[11px] text-ink-400">+{release.streamingProviders.length - 6}</span>
           )}
         </div>
       </div>
@@ -92,7 +94,7 @@ function MediaBadge({ type }: { type: Release["mediaType"] }) {
   const isMovie = type === "movie";
   return (
     <span
-      className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
         isMovie ? "bg-sky-500/15 text-sky-300" : "bg-violet-500/15 text-violet-300"
       }`}
     >
