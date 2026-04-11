@@ -122,6 +122,13 @@ interface TmdbWatchProviderRegion {
   buy?: TmdbWatchProvider[];
 }
 
+interface TmdbEpisodeInfo {
+  air_date: string | null;
+  episode_number: number;
+  season_number: number;
+  name: string;
+}
+
 interface TmdbDetails {
   id: number;
   title?: string;
@@ -133,6 +140,8 @@ interface TmdbDetails {
   first_air_date?: string;
   vote_average: number;
   genres: TmdbGenre[];
+  next_episode_to_air?: TmdbEpisodeInfo | null;
+  last_episode_to_air?: TmdbEpisodeInfo | null;
   videos?: { results: TmdbVideo[] };
   credits?: { cast: TmdbCastEntry[] };
   "watch/providers"?: { results: Record<string, TmdbWatchProviderRegion> };
@@ -220,20 +229,29 @@ async function discover(
   to: string,
   page: number,
 ): Promise<TmdbDiscoverResponse> {
-  const dateField = mediaType === "movie" ? "primary_release_date" : "first_air_date";
-  const sortField = mediaType === "movie" ? "primary_release_date.asc" : "first_air_date.asc";
+  const isMovie = mediaType === "movie";
+  // Movies: filter and sort by primary_release_date (simple case).
+  // TV: filter by `air_date` so we catch new SEASONS and EPISODES of existing
+  //     series, not just first-ever series launches. TMDB doesn't expose an
+  //     episode-level sort on /discover/tv, so sort by popularity and let the
+  //     client code re-sort by the actual next-episode date.
   const params: Record<string, string | number> = {
     include_adult: "false",
     include_video: "false",
     language: "en-US",
-    sort_by: sortField,
+    sort_by: isMovie ? "primary_release_date.asc" : "popularity.desc",
     watch_region: region,
     with_watch_monetization_types: "flatrate|free|ads",
     page,
-    [`${dateField}.gte`]: from,
-    [`${dateField}.lte`]: to,
   };
-  const endpoint = mediaType === "movie" ? "/discover/movie" : "/discover/tv";
+  if (isMovie) {
+    params["primary_release_date.gte"] = from;
+    params["primary_release_date.lte"] = to;
+  } else {
+    params["air_date.gte"] = from;
+    params["air_date.lte"] = to;
+  }
+  const endpoint = isMovie ? "/discover/movie" : "/discover/tv";
   return tmdbFetch<TmdbDiscoverResponse>(endpoint, { params });
 }
 
@@ -264,9 +282,10 @@ export async function fetchUpcomingReleases(
 ): Promise<Release[]> {
   const region = (opts.region || getRegion()).toUpperCase();
   const daysAhead = opts.daysAhead ?? 90;
-  const maxItems = opts.maxItems ?? 120;
+  const maxItems = opts.maxItems ?? 240;
   const includeMovies = opts.includeMovies ?? true;
   const includeTv = opts.includeTv ?? true;
+  const pagesPerType = 3;
 
   const now = new Date();
   const from = toYmd(now);
@@ -275,12 +294,14 @@ export async function fetchUpcomingReleases(
 
   const discoverCalls: Array<Promise<TmdbDiscoverResponse>> = [];
   if (includeMovies) {
-    discoverCalls.push(discover("movie", region, from, to, 1));
-    discoverCalls.push(discover("movie", region, from, to, 2));
+    for (let p = 1; p <= pagesPerType; p++) {
+      discoverCalls.push(discover("movie", region, from, to, p));
+    }
   }
   if (includeTv) {
-    discoverCalls.push(discover("tv", region, from, to, 1));
-    discoverCalls.push(discover("tv", region, from, to, 2));
+    for (let p = 1; p <= pagesPerType; p++) {
+      discoverCalls.push(discover("tv", region, from, to, p));
+    }
   }
 
   const discoverResults = await Promise.allSettled(discoverCalls);
@@ -289,7 +310,7 @@ export async function fetchUpcomingReleases(
   const candidates: Candidate[] = [];
   let resultIdx = 0;
   if (includeMovies) {
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < pagesPerType; i++) {
       const r = discoverResults[resultIdx++];
       if (r.status === "fulfilled") {
         for (const item of r.value.results) candidates.push({ mediaType: "movie", item });
@@ -297,7 +318,7 @@ export async function fetchUpcomingReleases(
     }
   }
   if (includeTv) {
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < pagesPerType; i++) {
       const r = discoverResults[resultIdx++];
       if (r.status === "fulfilled") {
         for (const item of r.value.results) candidates.push({ mediaType: "tv", item });
@@ -305,14 +326,16 @@ export async function fetchUpcomingReleases(
     }
   }
 
-  // Sort by release date ascending and cap to maxItems before detail fetches
-  candidates.sort((a, b) => {
-    const da = a.item.release_date || a.item.first_air_date || "";
-    const db = b.item.release_date || b.item.first_air_date || "";
-    return da.localeCompare(db);
+  // Dedupe candidates by (mediaType, id) before spending detail-fetch budget.
+  const seenCandidate = new Set<string>();
+  const uniqueCandidates = candidates.filter((c) => {
+    const key = `${c.mediaType}-${c.item.id}`;
+    if (seenCandidate.has(key)) return false;
+    seenCandidate.add(key);
+    return true;
   });
 
-  const capped = candidates.slice(0, maxItems);
+  const capped = uniqueCandidates.slice(0, maxItems);
 
   const detailResults = await Promise.allSettled(
     capped.map((c) => fetchDetails(c.mediaType, c.item.id)),
@@ -325,13 +348,39 @@ export async function fetchUpcomingReleases(
     if (detailRes.status !== "fulfilled") continue;
     const d = detailRes.value;
 
-    const title = d.title || d.name || item.title || item.name || "Untitled";
-    const releaseDate = d.release_date || d.first_air_date || item.release_date || item.first_air_date;
+    let title = d.title || d.name || item.title || item.name || "Untitled";
+
+    // Choose the release date.
+    // - Movies: primary release date.
+    // - TV: prefer next_episode_to_air.air_date so we surface upcoming seasons
+    //   and episodes rather than the show's original launch date.
+    let releaseDate: string | undefined;
+    if (mediaType === "movie") {
+      releaseDate = d.release_date || item.release_date;
+    } else {
+      const nextEp = d.next_episode_to_air;
+      if (nextEp?.air_date) {
+        releaseDate = nextEp.air_date;
+        const label =
+          nextEp.episode_number === 1
+            ? `Season ${nextEp.season_number} Premiere`
+            : `S${nextEp.season_number} \u00b7 E${nextEp.episode_number}`;
+        title = `${title} \u2014 ${label}`;
+      } else {
+        releaseDate = d.first_air_date || item.first_air_date;
+      }
+    }
+
     if (!releaseDate) continue;
+    // Clamp to the requested window. TMDB's TV discover by air_date can return
+    // shows whose *any* episode matches, but next_episode_to_air may be older
+    // or further out than we asked for.
+    if (releaseDate < from || releaseDate > to) continue;
 
     const providers = pickProviders(region, d["watch/providers"]);
-    // Only include releases that have at least one streaming provider in the region
-    if (providers.length === 0) continue;
+    // We intentionally keep items whose provider list is empty for the region:
+    // the discover call already filtered by streaming monetization, so these
+    // ARE on a streaming service -- TMDB just hasn't populated the logos yet.
 
     releases.push({
       id: `${mediaType}-${d.id}`,
