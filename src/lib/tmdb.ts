@@ -296,27 +296,32 @@ export interface FetchReleasesOptions {
 }
 
 /**
- * TMDB watch-provider IDs for the streamers we explicitly fan out against.
- * Provider-agnostic /discover sorts globally by popularity, which means low-
- * profile titles from any single service (unscripted, docs, international,
- * mid-tier originals) never make the top pages. Fetching per provider gives
- * each service a guaranteed allocation so Netflix doesn't have to compete
- * with Prime Video for the same 60 slots.
+ * The only streaming services this app considers. Discovery, display, and
+ * filtering are all scoped to this set. Adding/removing an entry changes
+ * what users see AND how deep the catalog scan goes (fewer providers ==
+ * more pages per provider within the same API budget).
  */
-const MAJOR_PROVIDER_IDS: ReadonlyArray<number> = [
-  8, // Netflix
-  9, // Amazon Prime Video
-  337, // Disney Plus
-  1899, // Max (HBO)
-  384, // HBO Max (legacy — still returns data in some regions)
-  15, // Hulu
-  350, // Apple TV+
-  531, // Paramount+
-  386, // Peacock Premium
-  283, // Crunchyroll
-  387, // Peacock Premium Plus
-  1770, // Paramount+ with Showtime
+interface AllowedProvider {
+  id: number;
+  name: string;
+}
+
+const ALLOWED_PROVIDERS: ReadonlyArray<AllowedProvider> = [
+  { id: 8, name: "Netflix" },
+  { id: 350, name: "Apple TV+" },
+  { id: 337, name: "Disney+" },
+  { id: 9, name: "Amazon Prime Video" },
+  { id: 15, name: "Hulu" },
+  { id: 386, name: "Peacock Premium" },
+  { id: 1899, name: "Max" },
+  { id: 283, name: "Crunchyroll" },
 ];
+
+const ALLOWED_PROVIDER_IDS: ReadonlyArray<number> = ALLOWED_PROVIDERS.map((p) => p.id);
+const ALLOWED_PROVIDER_ID_SET = new Set<number>(ALLOWED_PROVIDER_IDS);
+const ALLOWED_PROVIDER_NAME_BY_ID = new Map<number, string>(
+  ALLOWED_PROVIDERS.map((p) => [p.id, p.name]),
+);
 
 /** Bounded-concurrency runner so we don't blast TMDB with hundreds of
  *  parallel requests and get rate-limited. */
@@ -448,51 +453,53 @@ export async function fetchUpcomingReleases(
   const to = toYmd(endDate);
 
   // --- Phase 1: discovery ---------------------------------------------------
-  // We build a task list of discover calls:
-  //   (a) Generic region-wide queries (3 pages per media type) to catch the
-  //       long tail of smaller providers we don't explicitly enumerate.
-  //   (b) Per-provider queries against MAJOR_PROVIDER_IDS (2 pages per
-  //       (provider x media-type)). This guarantees each major streamer its
-  //       own allocation instead of competing globally with blockbusters for
-  //       the top 60 slots.
-  //   (c) A second TV pass sorted by first_air_date.desc, to surface brand
-  //       new series that popularity sort misses.
-  const GENERIC_PAGES = 3;
-  const PROVIDER_PAGES = 2;
-  type DiscoverTask = DiscoverArgs & { mediaType: MediaType };
+  // Only the providers in ALLOWED_PROVIDERS are scanned, so we drop the
+  // generic region-wide pass entirely and spend the saved API budget on
+  // deeper per-provider pagination. For each allowed provider we run:
+  //   * MOVIE_PAGES pages of /discover/movie (sort: primary_release_date.asc)
+  //   * TV_POP_PAGES pages of /discover/tv   (sort: popularity.desc)
+  //   * TV_NEW_PAGES pages of /discover/tv   (sort: first_air_date.desc) so
+  //     brand new series that popularity sort misses still surface.
+  const MOVIE_PAGES = 5;
+  const TV_POP_PAGES = 4;
+  const TV_NEW_PAGES = 3;
+  type DiscoverTask = DiscoverArgs & { mediaType: MediaType; providerId: number };
   const discoverTasks: DiscoverTask[] = [];
 
-  if (includeMovies) {
-    for (let p = 1; p <= GENERIC_PAGES; p++) {
-      discoverTasks.push({ mediaType: "movie", region, from, to, page: p });
-    }
-  }
-  if (includeTv) {
-    for (let p = 1; p <= GENERIC_PAGES; p++) {
-      discoverTasks.push({ mediaType: "tv", region, from, to, page: p });
-    }
-    // Second pass sorted by first_air_date.desc for new-series coverage.
-    for (let p = 1; p <= 2; p++) {
-      discoverTasks.push({
-        mediaType: "tv",
-        region,
-        from,
-        to,
-        page: p,
-        tvSort: "first_air_date.desc",
-      });
-    }
-  }
-
-  for (const providerId of MAJOR_PROVIDER_IDS) {
+  for (const providerId of ALLOWED_PROVIDER_IDS) {
     if (includeMovies) {
-      for (let p = 1; p <= PROVIDER_PAGES; p++) {
-        discoverTasks.push({ mediaType: "movie", region, from, to, page: p, providerId });
+      for (let p = 1; p <= MOVIE_PAGES; p++) {
+        discoverTasks.push({
+          mediaType: "movie",
+          region,
+          from,
+          to,
+          page: p,
+          providerId,
+        });
       }
     }
     if (includeTv) {
-      for (let p = 1; p <= PROVIDER_PAGES; p++) {
-        discoverTasks.push({ mediaType: "tv", region, from, to, page: p, providerId });
+      for (let p = 1; p <= TV_POP_PAGES; p++) {
+        discoverTasks.push({
+          mediaType: "tv",
+          region,
+          from,
+          to,
+          page: p,
+          providerId,
+        });
+      }
+      for (let p = 1; p <= TV_NEW_PAGES; p++) {
+        discoverTasks.push({
+          mediaType: "tv",
+          region,
+          from,
+          to,
+          page: p,
+          providerId,
+          tvSort: "first_air_date.desc",
+        });
       }
     }
   }
@@ -501,15 +508,30 @@ export async function fetchUpcomingReleases(
     discover(task),
   );
 
-  type Candidate = { mediaType: MediaType; item: TmdbDiscoverItem };
+  // Track which allowed providers each candidate was discovered under. If
+  // TMDB's watch/providers detail response later comes back empty for the
+  // region, we use this as a fallback so the release still carries a
+  // provider badge.
+  type Candidate = {
+    mediaType: MediaType;
+    item: TmdbDiscoverItem;
+    discoveredFrom: Set<number>;
+  };
   const candidatesByKey = new Map<string, Candidate>();
   discoverResults.forEach((res, i) => {
     if (res.status !== "fulfilled") return;
-    const mediaType = discoverTasks[i].mediaType;
+    const task = discoverTasks[i];
     for (const item of res.value.results) {
-      const key = `${mediaType}-${item.id}`;
-      if (!candidatesByKey.has(key)) {
-        candidatesByKey.set(key, { mediaType, item });
+      const key = `${task.mediaType}-${item.id}`;
+      const existing = candidatesByKey.get(key);
+      if (existing) {
+        existing.discoveredFrom.add(task.providerId);
+      } else {
+        candidatesByKey.set(key, {
+          mediaType: task.mediaType,
+          item,
+          discoveredFrom: new Set([task.providerId]),
+        });
       }
     }
   });
@@ -596,10 +618,23 @@ export async function fetchUpcomingReleases(
     // or further out than we asked for.
     if (releaseDate < from || releaseDate > to) continue;
 
-    const providers = pickProviders(region, d["watch/providers"]);
-    // We intentionally keep items whose provider list is empty for the region:
-    // the discover call already filtered by streaming monetization, so these
-    // ARE on a streaming service -- TMDB just hasn't populated the logos yet.
+    // Restrict to the ALLOWED_PROVIDERS list. If TMDB's watch/providers
+    // response has no allowed entry for this item (data lag), fall back to
+    // the set of allowed providers the discovery phase saw this item on.
+    const rawProviders = pickProviders(region, d["watch/providers"]);
+    let providers = rawProviders.filter((p) => ALLOWED_PROVIDER_ID_SET.has(p.id));
+    if (providers.length === 0) {
+      providers = Array.from(capped[i].discoveredFrom)
+        .filter((id) => ALLOWED_PROVIDER_ID_SET.has(id))
+        .map((id) => ({
+          id,
+          name: ALLOWED_PROVIDER_NAME_BY_ID.get(id) ?? `Provider ${id}`,
+          logoPath: null,
+        }));
+    }
+    // If we somehow still have nothing, skip the release entirely — it
+    // doesn't belong to any of our tracked services.
+    if (providers.length === 0) continue;
 
     const popularity = d.popularity ?? item.popularity ?? 0;
     const starPower = computeStarPower(d.credits?.cast);
