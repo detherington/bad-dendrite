@@ -8,6 +8,11 @@ import type { ReleasesResponse } from "@/lib/types";
 // `src/lib/tmdb.ts` are cached via the Next.js Data Cache for 6 hours, so
 // Vercel won't hammer TMDB on every request.
 export const dynamic = "force-dynamic";
+// Cold fetches touch TMDB (~650 calls), TVmaze (~90), and Streaming
+// Availability (~42), which sum to ~20-30s even with concurrency caps
+// and parallel phases. The Vercel Hobby default function timeout is 10s,
+// which was killing cold fetches. Bump to the Hobby max (60s).
+export const maxDuration = 60;
 
 async function loadReleases(): Promise<
   { ok: true; data: ReleasesResponse } | { ok: false; error: string; code?: string }

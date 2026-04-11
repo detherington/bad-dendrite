@@ -64,12 +64,22 @@ interface SaShow {
   streamingOptions?: Record<string, SaStreamingOption[]>;
 }
 
-/** Defensive union for /changes — the v4 docs show a `shows` array at the
- *  top level, but older/newer revisions have wrapped each entry in a
- *  `change` object. Handle either. */
+/** Defensive union for /changes responses. The v4 API actually returns
+ *  `shows` as a MAP keyed by show id (e.g. `"tv/12345"` → SaShow) plus
+ *  a `changes` index array that references those ids. Earlier revisions
+ *  of the API exposed `shows` as a plain array, and some wrappers nest
+ *  the show inside a `{ target }` field on each change entry. Handle
+ *  all three. */
 interface ChangesResponse {
-  shows?: SaShow[];
-  changes?: Array<{ target?: SaShow; change_type?: string; target_type?: string }>;
+  shows?: Record<string, SaShow> | SaShow[];
+  changes?: Array<{
+    changeType?: string;
+    targetType?: string;
+    itemId?: string;
+    showId?: string;
+    target?: SaShow;
+    show?: SaShow;
+  }>;
   hasMore?: boolean;
   nextCursor?: string;
 }
@@ -103,13 +113,47 @@ function parseTmdbIdString(
 }
 
 function extractShowsFromChanges(res: ChangesResponse): SaShow[] {
+  // v4 primary shape: `shows` is a map keyed by show id. Object.values
+  // gives us the full show objects directly.
+  if (res.shows && typeof res.shows === "object" && !Array.isArray(res.shows)) {
+    return Object.values(res.shows as Record<string, SaShow>);
+  }
+  // Earlier revisions returned `shows` as a plain array.
   if (Array.isArray(res.shows)) return res.shows;
+  // Some wrappers inline the show inside a `{ target }` or `{ show }`
+  // field on each change entry.
   if (Array.isArray(res.changes)) {
     return res.changes
-      .map((c) => c.target)
+      .map((c) => c.target ?? c.show)
       .filter((s): s is SaShow => s != null);
   }
   return [];
+}
+
+/** Bounded-concurrency runner so we can fan out (catalog × change_type)
+ *  pagination tasks in parallel without blasting RapidAPI's rate limits.
+ *  Local copy to keep this module free of imports from tmdb.ts. */
+async function runWithConcurrency<T, R>(
+  items: ReadonlyArray<T>,
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      try {
+        results[index] = { status: "fulfilled", value: await fn(items[index], index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function saFetch<T>(path: string, params: Record<string, string>): Promise<T> {
@@ -173,7 +217,12 @@ export interface SaDiagnostics {
   lastErrorStatus: number | null;
   /** First successful call's shape-detection breadcrumb so we can tell
    *  whether SA's response shape matches what we expected. */
-  responseShape: "shows" | "changes" | "unknown" | null;
+  responseShape: "shows-array" | "shows-map" | "changes" | "unknown" | null;
+  /** Top-level keys present on the first successful response, to help
+   *  diagnose unexpected shapes without leaking full response bodies. */
+  firstResponseKeys: string[] | null;
+  /** First raw response, truncated to ~1500 chars, for deep debugging. */
+  firstResponseSample: string | null;
 }
 
 export interface SaFetchResult {
@@ -208,6 +257,8 @@ export async function fetchStreamingAvailabilityUpcoming(
     lastError: null,
     lastErrorStatus: null,
     responseShape: null,
+    firstResponseKeys: null,
+    firstResponseSample: null,
   };
 
   if (!diagnostics.configured) {
@@ -218,96 +269,117 @@ export async function fetchStreamingAvailabilityUpcoming(
   const countryLc = country.toLowerCase();
   const results = new Map<string, SaUpcoming>();
 
+  // Enumerate all (provider, catalog, change_type) tasks up front so we
+  // can fan them out in parallel via a concurrency-bounded runner.
+  // Pagination within each task remains sequential (cursor-dependent).
+  type SaTask = { providerId: number; catalog: string; changeType: string };
+  const tasks: SaTask[] = [];
   for (const providerId of providerIds) {
     const catalog = TMDB_PROVIDER_TO_SA_CATALOG[providerId];
     if (!catalog) continue;
     diagnostics.catalogsQueried.push(catalog);
-
     for (const changeType of SA_CHANGE_TYPES) {
-      let cursor: string | undefined;
-      for (let page = 0; page < pagesPerProvider; page++) {
-        const params: Record<string, string> = {
-          country: countryLc,
-          change_type: changeType,
-          item_type: "show",
-          // Only titles that aren't available yet. Exactly what we want.
-          target_type: "upcoming",
-          catalogs: catalog,
-          order_by: "release_date",
-          order_direction: "asc",
-          output_language: "en",
-          limit: "25",
-        };
-        if (cursor) params.cursor = cursor;
-
-        diagnostics.callsAttempted++;
-        let res: ChangesResponse;
-        try {
-          res = await saFetch<ChangesResponse>("/changes", params);
-          diagnostics.callsSucceeded++;
-        } catch (err) {
-          diagnostics.callsFailed++;
-          const message = err instanceof Error ? err.message : String(err);
-          diagnostics.lastError = message.slice(0, 500);
-          const statusMatch = /^(?:Streaming Availability|SA)\s+(\d{3})/.exec(message);
-          if (statusMatch) {
-            diagnostics.lastErrorStatus = parseInt(statusMatch[1], 10);
-          }
-          console.error(
-            `[streaming-availability] ${catalog}/${changeType} page ${page}: ${message}`,
-          );
-          // Stop paginating this (catalog, change_type) on error, but
-          // keep going with the remaining combinations.
-          break;
-        }
-
-        // Record which top-level shape SA actually returned so we can tell
-        // whether our parser matches the current API contract.
-        if (diagnostics.responseShape == null) {
-          if (Array.isArray((res as ChangesResponse).shows)) {
-            diagnostics.responseShape = "shows";
-          } else if (Array.isArray((res as ChangesResponse).changes)) {
-            diagnostics.responseShape = "changes";
-          } else {
-            diagnostics.responseShape = "unknown";
-          }
-        }
-
-        const shows = extractShowsFromChanges(res);
-        for (const show of shows) {
-          const parsed = parseTmdbIdString(show.tmdbId);
-          if (!parsed) continue;
-          const key = `${parsed.mediaType}-${parsed.id}`;
-          const existing = results.get(key);
-          if (existing) {
-            existing.providerIds.add(providerId);
-            continue;
-          }
-
-          // Derive the soonest release date from streamingOptions[country]
-          // availableSince timestamps, if any.
-          const options = show.streamingOptions?.[countryLc] ?? [];
-          const earliest = options
-            .map((o) => o.availableSince)
-            .filter((ts): ts is number => typeof ts === "number" && ts > 0)
-            .sort((a, b) => a - b)[0];
-          const releaseDate = earliest
-            ? new Date(earliest * 1000).toISOString().slice(0, 10)
-            : null;
-
-          results.set(key, {
-            mediaType: parsed.mediaType,
-            tmdbId: parsed.id,
-            providerIds: new Set([providerId]),
-            releaseDate,
-          });
-        }
-
-        if (!res.hasMore || !res.nextCursor) break;
-        cursor = res.nextCursor;
-      }
+      tasks.push({ providerId, catalog, changeType });
     }
   }
+
+  /** Per-task pagination loop. Mutates shared diagnostics + results. */
+  const runOne = async ({ providerId, catalog, changeType }: SaTask): Promise<void> => {
+    let cursor: string | undefined;
+    for (let page = 0; page < pagesPerProvider; page++) {
+      const params: Record<string, string> = {
+        country: countryLc,
+        change_type: changeType,
+        item_type: "show",
+        // Only titles that aren't available yet. Exactly what we want.
+        target_type: "upcoming",
+        catalogs: catalog,
+        order_by: "release_date",
+        order_direction: "asc",
+        output_language: "en",
+        limit: "25",
+      };
+      if (cursor) params.cursor = cursor;
+
+      diagnostics.callsAttempted++;
+      let res: ChangesResponse;
+      try {
+        res = await saFetch<ChangesResponse>("/changes", params);
+        diagnostics.callsSucceeded++;
+      } catch (err) {
+        diagnostics.callsFailed++;
+        const message = err instanceof Error ? err.message : String(err);
+        diagnostics.lastError = message.slice(0, 500);
+        const statusMatch = /^(?:Streaming Availability|SA)\s+(\d{3})/.exec(message);
+        if (statusMatch) {
+          diagnostics.lastErrorStatus = parseInt(statusMatch[1], 10);
+        }
+        console.error(
+          `[streaming-availability] ${catalog}/${changeType} page ${page}: ${message}`,
+        );
+        return;
+      }
+
+      // Capture diagnostics about the first successful response so we can
+      // tell whether our parser matches the current API contract.
+      if (diagnostics.responseShape == null) {
+        const shows = res.shows;
+        if (shows && typeof shows === "object" && !Array.isArray(shows)) {
+          diagnostics.responseShape = "shows-map";
+        } else if (Array.isArray(shows)) {
+          diagnostics.responseShape = "shows-array";
+        } else if (Array.isArray(res.changes)) {
+          diagnostics.responseShape = "changes";
+        } else {
+          diagnostics.responseShape = "unknown";
+        }
+        try {
+          diagnostics.firstResponseKeys = Object.keys(res as object);
+          diagnostics.firstResponseSample = JSON.stringify(res).slice(0, 1500);
+        } catch {
+          /* ignore — just diagnostic */
+        }
+      }
+
+      const shows = extractShowsFromChanges(res);
+      for (const show of shows) {
+        const parsed = parseTmdbIdString(show.tmdbId);
+        if (!parsed) continue;
+        const key = `${parsed.mediaType}-${parsed.id}`;
+        const existing = results.get(key);
+        if (existing) {
+          existing.providerIds.add(providerId);
+          continue;
+        }
+
+        // Derive the soonest release date from streamingOptions[country]
+        // availableSince timestamps, if any.
+        const options = show.streamingOptions?.[countryLc] ?? [];
+        const earliest = options
+          .map((o) => o.availableSince)
+          .filter((ts): ts is number => typeof ts === "number" && ts > 0)
+          .sort((a, b) => a - b)[0];
+        const releaseDate = earliest
+          ? new Date(earliest * 1000).toISOString().slice(0, 10)
+          : null;
+
+        results.set(key, {
+          mediaType: parsed.mediaType,
+          tmdbId: parsed.id,
+          providerIds: new Set([providerId]),
+          releaseDate,
+        });
+      }
+
+      if (!res.hasMore || !res.nextCursor) break;
+      cursor = res.nextCursor;
+    }
+  };
+
+  // RapidAPI basic/free plans cap around 5 req/sec. Concurrency 3 keeps
+  // us safely inside that even during the burst at the start of a cold
+  // fetch, while still cutting wall-clock latency ~3× vs. sequential.
+  await runWithConcurrency(tasks, 3, runOne);
 
   diagnostics.itemsReturned = results.size;
   return { items: Array.from(results.values()), diagnostics };

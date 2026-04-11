@@ -6,6 +6,10 @@ import {
 } from "@/lib/tmdb";
 
 export const revalidate = 21600; // 6 hours
+// Same cold-fetch timeout concern as src/app/page.tsx — bump to the
+// Vercel Hobby max so the first request after a cache miss can
+// actually complete.
+export const maxDuration = 60;
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);

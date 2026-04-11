@@ -309,10 +309,10 @@ function computeStarPower(cast: TmdbCastEntry[] | undefined): number {
 }
 
 /** Pick the display date for a movie from TMDB's regional release_dates.
- *  Prefers an upcoming DIGITAL (4) or TV (6) release in the user's region
- *  that falls inside the window, then falls back to any regional release
- *  in the window, then to the primary release date, and finally returns
- *  null to signal "drop this item". */
+ *  ONLY returns Digital (type 4) or TV (type 6) release dates — this is a
+ *  streaming-releases app, so theatrical dates (types 2 and 3) are
+ *  treated as "movie is in cinemas, not yet streaming" and get dropped.
+ *  Returns null to signal "drop this item". */
 function pickMovieReleaseDate(
   details: TmdbDetails,
   region: string,
@@ -323,31 +323,31 @@ function pickMovieReleaseDate(
     (r) => r.iso_3166_1 === region,
   );
   if (regional?.release_dates?.length) {
-    // Keep only the date portion, filter to the window.
-    const inWindow = regional.release_dates
+    const streamingInWindow = regional.release_dates
       .map((rd) => ({
         date: (rd.release_date || "").slice(0, 10),
         type: rd.type,
       }))
-      .filter((rd) => rd.date && rd.date >= from && rd.date <= to);
-
-    // Prefer Digital (4) or TV (6) — that's the actual "streaming" release.
-    const streaming = inWindow
+      .filter((rd) => rd.date && rd.date >= from && rd.date <= to)
       .filter((rd) => rd.type === 4 || rd.type === 6)
       .sort((a, b) => a.date.localeCompare(b.date));
-    if (streaming.length > 0) return streaming[0].date;
-
-    // Otherwise take the earliest in-window release of any type.
-    if (inWindow.length > 0) {
-      return inWindow.sort((a, b) => a.date.localeCompare(b.date))[0].date;
-    }
+    if (streamingInWindow.length > 0) return streamingInWindow[0].date;
   }
 
-  // Last resort: primary (worldwide earliest) release date, but only if
-  // it's actually inside the window — streaming originals have their
-  // primary set to the streaming release date, so this still catches them.
-  const primary = (details.release_date || "").slice(0, 10);
-  if (primary && primary >= from && primary <= to) return primary;
+  // Fall back to primary (worldwide earliest) release date, but ONLY if:
+  //   1. It's inside the window, AND
+  //   2. The movie has NO theatrical release anywhere in its release_dates
+  //      (type 2 or 3). That preserves true streaming-first originals
+  //      whose primary field equals their digital drop date, while
+  //      excluding theatrical-first movies whose primary field equals
+  //      their cinema date.
+  const hasAnyTheatrical = details.release_dates?.results?.some((r) =>
+    r.release_dates?.some((rd) => rd.type === 2 || rd.type === 3),
+  );
+  if (!hasAnyTheatrical) {
+    const primary = (details.release_date || "").slice(0, 10);
+    if (primary && primary >= from && primary <= to) return primary;
+  }
 
   return null;
 }
@@ -993,19 +993,18 @@ export async function fetchUpcomingReleasesWithDiagnostics(
   // a .catch in case an unexpected error escapes the client (it shouldn't
   // — the client captures errors into diagnostics.lastError — but defense
   // in depth).
-  const emptySaResult: SaFetchResult = {
-    items: [],
-    diagnostics: {
-      configured: isStreamingAvailabilityConfigured(),
-      catalogsQueried: [],
-      callsAttempted: 0,
-      callsSucceeded: 0,
-      callsFailed: 0,
-      itemsReturned: 0,
-      lastError: null,
-      lastErrorStatus: null,
-      responseShape: null,
-    },
+  const emptySaDiagnostics: SaDiagnostics = {
+    configured: isStreamingAvailabilityConfigured(),
+    catalogsQueried: [],
+    callsAttempted: 0,
+    callsSucceeded: 0,
+    callsFailed: 0,
+    itemsReturned: 0,
+    lastError: null,
+    lastErrorStatus: null,
+    responseShape: null,
+    firstResponseKeys: null,
+    firstResponseSample: null,
   };
   const [discoverResults, tvmazeEpisodes, saResult] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),
@@ -1016,12 +1015,10 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       (err): SaFetchResult => ({
         items: [],
         diagnostics: {
-          ...emptySaResult.diagnostics,
+          ...emptySaDiagnostics,
           callsAttempted: 1,
           callsFailed: 1,
           lastError: err instanceof Error ? err.message.slice(0, 500) : String(err),
-          lastErrorStatus: null,
-          responseShape: null,
         },
       }),
     ),
