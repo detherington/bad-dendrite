@@ -48,10 +48,20 @@ interface WikipediaSource {
 }
 
 const WIKIPEDIA_SOURCES: ReadonlyArray<WikipediaSource> = [
-  // Netflix
+  // Netflix: `List_of_Netflix_original_films` redirects to a plural
+  // disambiguation page that only links out to per-year articles.
+  // Target the per-year pages directly for the current and next
+  // calendar year so the 90-day window is guaranteed to overlap at
+  // least one of them.
   {
-    name: "wikipedia-netflix-films",
-    url: "https://en.wikipedia.org/wiki/List_of_Netflix_original_films",
+    name: "wikipedia-netflix-films-2026",
+    url: "https://en.wikipedia.org/wiki/List_of_Netflix_original_films_(2026)",
+    providerId: 8,
+    mediaType: "movie",
+  },
+  {
+    name: "wikipedia-netflix-films-2027",
+    url: "https://en.wikipedia.org/wiki/List_of_Netflix_original_films_(2027)",
     providerId: 8,
     mediaType: "movie",
   },
@@ -243,10 +253,27 @@ function findUpcomingTables(root: HTMLElement): HTMLElement[] {
 
 /** Extract ScrapedReleases from one `<table class="wikitable">`.
  *
- *  Wikipedia's `sortable` wikitables mark date cells with a
- *  `data-sort-value` attribute containing ISO-ish strings we can
- *  parse cheaply (e.g. "2026-03-15-0000" or "20260315"). Falls back
- *  to free-form date parsing on raw cell text. */
+ *  Wikipedia tables in these "list of X programming" pages vary a lot
+ *  in column layout — some put the date first, some put the title
+ *  first, some have caption rows that look like data rows, and some
+ *  have genre sub-headers embedded as rows. Rather than assume any
+ *  specific column order, we:
+ *
+ *    1. Find a *title cell* by scanning all cells for an italicised
+ *       wiki link (`<td><i><a href="/wiki/...">Title</a></i></td>`),
+ *       which is Wikipedia's convention for show/film titles. Fall
+ *       back to any italicised text, then any `/wiki/` link. Skip
+ *       rows where no cell looks like a title — that drops caption
+ *       rows, genre headers, and date-header-only rows.
+ *    2. Find a *date cell* by scanning every OTHER cell (never the
+ *       title cell) for a `data-sort-value` first, then free-form
+ *       date text. Validate dates against a plausible year range so
+ *       bogus sort values like "0000-00-00" never propagate.
+ *    3. Reject rows where the "title" itself parses as a date — a
+ *       sanity check that catches rows where Disney+ put the date
+ *       first and the parser somehow promoted it.
+ *
+ *  Strip citation footnotes like `[1]` everywhere. Cap title length. */
 function parseWikipediaTable(
   table: HTMLElement,
   spec: WikipediaSource,
@@ -256,42 +283,88 @@ function parseWikipediaTable(
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     const cells = row.querySelectorAll("td");
-    if (cells.length === 0) continue; // header row has only <th>
+    if (cells.length === 0) continue; // header row (only <th>)
 
-    // Title: the first `<td>`. Prefer the text of the first `<i>` or
-    // `<a>` inside it (Wikipedia italicises show titles and links
-    // them to the show's page). Fall back to plain cell text.
-    const firstCell = cells[0];
-    const italicEl = firstCell.querySelector("i a") || firstCell.querySelector("i");
-    const linkEl = firstCell.querySelector("a");
-    let title = "";
-    if (italicEl) title = italicEl.text.trim();
-    else if (linkEl) title = linkEl.text.trim();
-    else title = firstCell.text.trim();
-    title = title.replace(/\[[\d\s]+\]/g, "").trim(); // strip citation footnotes
-    if (!title || title.length < 2 || title.length > 200) continue;
-
-    // Release date: scan every cell for a data-sort-value first, then
-    // fall back to free-form parsing.
-    let releaseDate: string | null = null;
+    // ---- Find title cell ----
+    let titleCell: HTMLElement | null = null;
+    let titleText = "";
+    // Preference 1: italicised wiki link.
     for (const cell of cells) {
-      const sortNode = cell.querySelector("[data-sort-value]");
-      if (sortNode) {
-        const val = sortNode.getAttribute("data-sort-value");
-        if (val) {
-          const parsed = parseSortValue(val);
-          if (parsed) {
-            releaseDate = parsed;
+      const italicLink = cell.querySelector('i a[href^="/wiki/"]');
+      if (italicLink) {
+        const text = italicLink.text.trim();
+        if (text.length >= 2) {
+          titleCell = cell;
+          titleText = text;
+          break;
+        }
+      }
+    }
+    // Preference 2: any italicised text.
+    if (!titleCell) {
+      for (const cell of cells) {
+        const italic = cell.querySelector("i");
+        if (italic) {
+          const text = italic.text.trim();
+          if (text.length >= 2) {
+            titleCell = cell;
+            titleText = text;
             break;
           }
         }
       }
     }
+    // Preference 3: any /wiki/ link (not pointing to a date page).
+    if (!titleCell) {
+      for (const cell of cells) {
+        const link = cell.querySelector('a[href^="/wiki/"]');
+        if (!link) continue;
+        const text = link.text.trim();
+        if (text.length < 2) continue;
+        // Skip links that look like date pages (/wiki/April_15,_2026, etc).
+        const href = link.getAttribute("href") ?? "";
+        if (/\d{4}|january|february|march|april|may|june|july|august|september|october|november|december/i.test(href)) {
+          continue;
+        }
+        titleCell = cell;
+        titleText = text;
+        break;
+      }
+    }
+    if (!titleCell || !titleText) continue;
+
+    // Clean up: strip `[12]`-style citation footnotes, quoted chars.
+    titleText = titleText.replace(/\[[\d\s,]+\]/g, "").trim();
+    if (!titleText || titleText.length < 2 || titleText.length > 200) continue;
+    // Sanity check: if the "title" parses as a date, it's a header row
+    // or a mis-identified cell. Drop it.
+    if (parseFreeformDate(titleText)) continue;
+
+    // ---- Find date cell ----
+    let releaseDate: string | null = null;
+    // Preference 1: any cell (other than the title cell) with a
+    // data-sort-value that parses as a valid date.
+    for (const cell of cells) {
+      if (cell === titleCell) continue;
+      const sortNode = cell.querySelector("[data-sort-value]");
+      if (!sortNode) continue;
+      const val = sortNode.getAttribute("data-sort-value");
+      if (!val) continue;
+      const parsed = parseSortValue(val);
+      if (parsed && isValidDate(parsed)) {
+        releaseDate = parsed;
+        break;
+      }
+    }
+    // Preference 2: any cell's text content that parses as a free-form
+    // date, again excluding the title cell.
     if (!releaseDate) {
       for (const cell of cells) {
-        const text = cell.text.replace(/\[[\d\s]+\]/g, "").trim();
+        if (cell === titleCell) continue;
+        const text = cell.text.replace(/\[[\d\s,]+\]/g, "").trim();
+        if (!text || text.length > 120) continue;
         const parsed = parseFreeformDate(text);
-        if (parsed) {
+        if (parsed && isValidDate(parsed)) {
           releaseDate = parsed;
           break;
         }
@@ -300,7 +373,7 @@ function parseWikipediaTable(
     if (!releaseDate) continue;
 
     out.push({
-      title,
+      title: titleText,
       year: parseInt(releaseDate.slice(0, 4), 10) || undefined,
       releaseDate,
       providerId: spec.providerId,
@@ -312,11 +385,26 @@ function parseWikipediaTable(
   return out;
 }
 
+/** Guard against bogus dates like "0000-00-00" or year 1900. */
+function isValidDate(ymd: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return false;
+  const year = parseInt(ymd.slice(0, 4), 10);
+  if (year < 2000 || year > 2100) return false;
+  const month = parseInt(ymd.slice(5, 7), 10);
+  if (month < 1 || month > 12) return false;
+  const day = parseInt(ymd.slice(8, 10), 10);
+  if (day < 1 || day > 31) return false;
+  return true;
+}
+
 /** Normalise a Wikipedia `data-sort-value` string to YYYY-MM-DD. */
 function parseSortValue(val: string): string | null {
-  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(val);
+  // Wikipedia sort values sometimes have a leading "!" trick to
+  // force a sort order. Strip it.
+  const stripped = val.replace(/^!+/, "");
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(stripped);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const compact = /^(\d{4})(\d{2})(\d{2})/.exec(val);
+  const compact = /^(\d{4})(\d{2})(\d{2})/.exec(stripped);
   if (compact) return `${compact[1]}-${compact[2]}-${compact[3]}`;
   return null;
 }
