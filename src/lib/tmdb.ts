@@ -143,6 +143,22 @@ interface TmdbEpisodeInfo {
   name: string;
 }
 
+/** One row inside `movie.release_dates[].release_dates` for a region.
+ *  `type`: 1=Premiere 2=Theatrical(limited) 3=Theatrical 4=Digital
+ *          5=Physical 6=TV
+ *  We care about 4 and 6 for "coming to streaming" display dates. */
+interface TmdbRegionalReleaseDate {
+  release_date: string; // full ISO-8601 timestamp
+  type: number;
+  certification?: string;
+  note?: string;
+}
+
+interface TmdbReleaseDatesRegion {
+  iso_3166_1: string;
+  release_dates: TmdbRegionalReleaseDate[];
+}
+
 interface TmdbDetails {
   id: number;
   title?: string;
@@ -159,6 +175,7 @@ interface TmdbDetails {
   last_episode_to_air?: TmdbEpisodeInfo | null;
   videos?: { results: TmdbVideo[] };
   credits?: { cast: TmdbCastEntry[] };
+  release_dates?: { results: TmdbReleaseDatesRegion[] };
   "watch/providers"?: { results: Record<string, TmdbWatchProviderRegion> };
 }
 
@@ -270,6 +287,50 @@ function computeStarPower(cast: TmdbCastEntry[] | undefined): number {
   // Sum the top 3 cast popularities as a rough proxy for "big stars attached."
   const sorted = [...cast].sort((a, b) => (b.popularity ?? 0) - (a.popularity ?? 0));
   return sorted.slice(0, 3).reduce((acc, c) => acc + (c.popularity ?? 0), 0);
+}
+
+/** Pick the display date for a movie from TMDB's regional release_dates.
+ *  Prefers an upcoming DIGITAL (4) or TV (6) release in the user's region
+ *  that falls inside the window, then falls back to any regional release
+ *  in the window, then to the primary release date, and finally returns
+ *  null to signal "drop this item". */
+function pickMovieReleaseDate(
+  details: TmdbDetails,
+  region: string,
+  from: string,
+  to: string,
+): string | null {
+  const regional = details.release_dates?.results?.find(
+    (r) => r.iso_3166_1 === region,
+  );
+  if (regional?.release_dates?.length) {
+    // Keep only the date portion, filter to the window.
+    const inWindow = regional.release_dates
+      .map((rd) => ({
+        date: (rd.release_date || "").slice(0, 10),
+        type: rd.type,
+      }))
+      .filter((rd) => rd.date && rd.date >= from && rd.date <= to);
+
+    // Prefer Digital (4) or TV (6) — that's the actual "streaming" release.
+    const streaming = inWindow
+      .filter((rd) => rd.type === 4 || rd.type === 6)
+      .sort((a, b) => a.date.localeCompare(b.date));
+    if (streaming.length > 0) return streaming[0].date;
+
+    // Otherwise take the earliest in-window release of any type.
+    if (inWindow.length > 0) {
+      return inWindow.sort((a, b) => a.date.localeCompare(b.date))[0].date;
+    }
+  }
+
+  // Last resort: primary (worldwide earliest) release date, but only if
+  // it's actually inside the window — streaming originals have their
+  // primary set to the streaming release date, so this still catches them.
+  const primary = (details.release_date || "").slice(0, 10);
+  if (primary && primary >= from && primary <= to) return primary;
+
+  return null;
 }
 
 function pickProviders(
@@ -389,35 +450,44 @@ interface DiscoverArgs {
 async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
   const { mediaType, region, from, to, page, providerId, networkId, releaseType, tvSort } = args;
   const isMovie = mediaType === "movie";
-  // Movies: filter and sort by primary_release_date (simple case).
-  // TV: filter by `air_date` so we catch new SEASONS and EPISODES of existing
-  //     series, not just first-ever series launches. TMDB doesn't expose an
-  //     episode-level sort on /discover/tv, so sort by popularity and let the
-  //     client code re-sort by the actual next-episode date.
-  const useRegionalRelease = isMovie && releaseType != null;
+  // MOVIES: always filter and sort by REGIONAL `release_date.*` instead of
+  // `primary_release_date.*`. Primary is the earliest worldwide theatrical
+  // date, so a movie that hit cinemas 6 months ago and is *now* arriving on
+  // Netflix has a primary date in the past and gets filtered out of a
+  // 90-day future window. `release_date` with `region=US` covers every
+  // US-scoped release type (theatrical, digital, TV), so the movie's
+  // digital arrival date puts it inside the window as expected.
+  //
+  // TV: still filter by `air_date` so we catch new SEASONS and EPISODES of
+  // existing series, not just first-ever series launches. TMDB doesn't
+  // expose an episode-level sort on /discover/tv, so sort by popularity
+  // (or first_air_date.desc for the second pass) and let the client code
+  // re-sort by the actual next-episode date downstream.
   const params: Record<string, string | number> = {
     include_adult: "false",
     include_video: "false",
     language: "en-US",
-    sort_by: isMovie
-      ? useRegionalRelease
-        ? "release_date.asc"
-        : "primary_release_date.asc"
-      : tvSort ?? "popularity.desc",
+    sort_by: isMovie ? "release_date.asc" : tvSort ?? "popularity.desc",
     page,
   };
   if (providerId != null) {
-    // Availability-based pass: requires watch_region. Filters to what TMDB
-    // has flagged as currently available on the given service in the region.
+    // Availability-based pass: scopes to what TMDB has flagged as currently
+    // available on the given service in the region.
     params.watch_region = region;
     params.with_watch_providers = providerId;
     params.with_watch_monetization_types = "flatrate|free|ads";
+    // For movies we ALSO pass `region` so `release_date.*` narrows to that
+    // country's release windows (which include the digital/TV release
+    // types, not just the original theatrical date).
+    if (isMovie) {
+      params.region = region;
+    }
   } else if (networkId != null) {
-    // Production-based pass: no watch_region. Filters by the TV network that
-    // owns the show, so Netflix originals surface even when their per-region
-    // watch_providers data hasn't been populated yet.
+    // Production-based pass (TV): no region needed. Filters by the TV
+    // network that owns the show, so Netflix originals surface even when
+    // their per-region watch_providers data hasn't been populated yet.
     params.with_networks = networkId;
-  } else if (useRegionalRelease) {
+  } else if (releaseType != null && isMovie) {
     // Release-type pass (movies only): finds movies with a Digital (4) or
     // TV (6) release type in the region, regardless of whether TMDB has
     // populated per-region watch_providers yet. Catches upcoming streaming
@@ -427,14 +497,8 @@ async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
     params.with_release_type = releaseType as string;
   }
   if (isMovie) {
-    if (useRegionalRelease) {
-      // Regional release date window — used with `region` + release_type.
-      params["release_date.gte"] = from;
-      params["release_date.lte"] = to;
-    } else {
-      params["primary_release_date.gte"] = from;
-      params["primary_release_date.lte"] = to;
-    }
+    params["release_date.gte"] = from;
+    params["release_date.lte"] = to;
   } else {
     params["air_date.gte"] = from;
     params["air_date.lte"] = to;
@@ -445,10 +509,15 @@ async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
 
 async function fetchDetails(mediaType: MediaType, id: number): Promise<TmdbDetails> {
   const endpoint = mediaType === "movie" ? `/movie/${id}` : `/tv/${id}`;
+  // Movies also pull `release_dates` so we can pick the regional digital/TV
+  // release for display instead of the primary (theatrical) date.
+  const append = mediaType === "movie"
+    ? "videos,credits,watch/providers,release_dates"
+    : "videos,credits,watch/providers";
   return tmdbFetch<TmdbDetails>(endpoint, {
     params: {
       language: "en-US",
-      append_to_response: "videos,credits,watch/providers",
+      append_to_response: append,
       // Include videos whose language is English OR unset, so language-tagged
       // trailers don't get filtered out by the parent language=en-US param.
       include_video_language: "en,null",
@@ -877,7 +946,10 @@ export async function fetchUpcomingReleases(
     let highlightLabel: string | null = null;
 
     if (mediaType === "movie") {
-      releaseDate = d.release_date || item.release_date;
+      // Use the regional digital/TV release date for display so a movie
+      // that hit cinemas 6 months ago and is now arriving on Netflix shows
+      // its actual streaming date, not its long-past theatrical date.
+      releaseDate = pickMovieReleaseDate(d, region, from, to) ?? undefined;
       highlightKind = "movie-release";
       highlightLabel = "New Movie";
     } else {
