@@ -1,24 +1,20 @@
 /** Netflix Tudum scraper.
  *
- *  Netflix's own editorial site (netflix.com/tudum) publishes monthly
- *  "Coming to Netflix" articles. The main landing page at
- *  /tudum/articles/new-on-netflix redirects to or renders whichever
- *  article is current. Tudum is built on Next.js, so the article
- *  content is present in the page as a serialised `__NEXT_DATA__`
- *  blob — even when the rendered HTML doesn't expose a clean
- *  schema.org outline.
+ *  Tudum is Netflix's own editorial site. The /new-on-netflix URL
+ *  redirects to whichever month-specific article is current (e.g.
+ *  "New on Netflix in April 2026"). Tudum is a React + Apollo GraphQL
+ *  app, NOT Next.js — so the hydration payload lives in something
+ *  like `window.__APOLLO_STATE__` or a similar state-assignment script,
+ *  not in `<script id="__NEXT_DATA__">`.
  *
- *  Parse strategies, in order:
- *    1. JSON-LD entities (Movie / TVSeries).
- *    2. __NEXT_DATA__ JSON tree walk: find every nested object that
- *       carries a plausible `{ title, releaseDate }` pair. This is how
- *       we get the actual editorial list of upcoming titles.
- *
- *  Diagnostics capture:
- *    - `fetchedHtmlSample`: first 2000 chars of the raw HTML.
- *    - `nextDataSample`: first 2000 chars of the parsed __NEXT_DATA__
- *      payload (when present). The next debug run will show exactly
- *      what shape Tudum uses so we can tighten the extractor. */
+ *  Rather than guess the exact script pattern, we use the shared
+ *  `scanScriptsForJsonPayloads` helper which tries every plausible
+ *  extractor (typed JSON scripts, plain-JSON scripts, inline
+ *  `window.__FOO__ = { ... };` assignments) against every
+ *  `<script>` tag on the page. Anything that parses is fed through
+ *  `walkForTitleDatePairs()`, which finds nested objects with
+ *  `{ title, releaseDate }` pairs regardless of the surrounding
+ *  schema. */
 
 import { fetchHtml, parseDocument } from "./fetch";
 import {
@@ -26,6 +22,10 @@ import {
   mediaTypeFromJsonLdType,
 } from "./json-ld";
 import { walkForTitleDatePairs } from "./json-walk";
+import {
+  inventoryScripts,
+  scanScriptsForJsonPayloads,
+} from "./script-scan";
 import type { ScrapedRelease, ScraperDiagnostic, ScraperResult } from "./types";
 
 const SOURCE = "netflix-tudum";
@@ -46,6 +46,7 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
     htmlBytes: 0,
     fetchedHtmlSample: null,
     nextDataSample: null,
+    scriptInventory: [],
   };
 
   const fetchResult = await fetchHtml(TUDUM_URL);
@@ -62,6 +63,9 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
 
   const root = parseDocument(fetchResult.html);
   const releases: ScrapedRelease[] = [];
+
+  // Always populate the script inventory for diagnostics.
+  diagnostic.scriptInventory = inventoryScripts(root);
 
   // ---- Strategy 1: JSON-LD ------------------------------------------------
   const jsonLdEntities = extractJsonLdEntities(root);
@@ -81,45 +85,44 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
   }
   if (releases.length > 0) diagnostic.parseStrategy = "json-ld";
 
-  // ---- Strategy 2: __NEXT_DATA__ tree walk -------------------------------
-  // Netflix Tudum is a Next.js site. The article body is serialised into
-  // a <script id="__NEXT_DATA__"> JSON blob for hydration. We recursively
-  // walk the tree looking for objects with a plausible (title, date)
-  // pair, which covers most ways Tudum could represent a "coming soon"
-  // list regardless of its specific schema.
-  const nextDataScript = root.querySelector('script#__NEXT_DATA__');
-  if (nextDataScript?.rawText) {
-    diagnostic.nextDataSample = nextDataScript.rawText.slice(0, 2000);
-    try {
-      const parsed = JSON.parse(nextDataScript.rawText);
-      const walked = walkForTitleDatePairs(parsed);
-      for (const item of walked) {
-        releases.push({
-          title: item.title,
-          year: item.year,
-          releaseDate: item.releaseDate,
-          providerId: NETFLIX_PROVIDER_ID,
-          mediaType: item.mediaType,
-          source: SOURCE,
-          sourceUrl: TUDUM_URL,
-        });
+  // ---- Strategy 2: aggressive <script> scan ------------------------------
+  // Try every plausible JSON-payload extractor against every script tag.
+  // Capture the first payload that produces any title/date pairs in the
+  // diagnostics so we can inspect the source when items look wrong.
+  const payloads = scanScriptsForJsonPayloads(root);
+  let firstMatchingPayload: string | null = null;
+  let scannedMatches = 0;
+  for (const { value, source } of payloads) {
+    const items = walkForTitleDatePairs(value);
+    if (items.length === 0) continue;
+    if (!firstMatchingPayload) {
+      firstMatchingPayload = source;
+      try {
+        diagnostic.nextDataSample = JSON.stringify(value).slice(0, 2000);
+      } catch {
+        /* ignore */
       }
-      if (walked.length > 0) {
-        diagnostic.parseStrategy = diagnostic.parseStrategy
-          ? `${diagnostic.parseStrategy}+next-data`
-          : "next-data";
-      }
-    } catch (err) {
-      diagnostic.error = `__NEXT_DATA__ parse failed: ${
-        err instanceof Error ? err.message : String(err)
-      }`;
+    }
+    scannedMatches += items.length;
+    for (const item of items) {
+      releases.push({
+        title: item.title,
+        year: item.year,
+        releaseDate: item.releaseDate,
+        providerId: NETFLIX_PROVIDER_ID,
+        mediaType: item.mediaType,
+        source: SOURCE,
+        sourceUrl: TUDUM_URL,
+      });
     }
   }
+  if (scannedMatches > 0) {
+    diagnostic.parseStrategy = diagnostic.parseStrategy
+      ? `${diagnostic.parseStrategy}+script-scan(${firstMatchingPayload})`
+      : `script-scan(${firstMatchingPayload})`;
+  }
 
-  // Dedupe by (normalised title, releaseDate) since both strategies may
-  // surface the same entry.
   const deduped = dedupeReleases(releases);
-
   diagnostic.itemsFound = deduped.length;
   diagnostic.samples = deduped.slice(0, 5).map((r) => ({
     title: r.title,
@@ -129,8 +132,6 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
 
   return { releases: deduped, diagnostics: [diagnostic] };
 }
-
-// ---------- Dedupe ----------
 
 function dedupeReleases(list: ScrapedRelease[]): ScrapedRelease[] {
   const seen = new Set<string>();

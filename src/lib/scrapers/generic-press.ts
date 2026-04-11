@@ -19,6 +19,7 @@ import {
   extractJsonLdEntities,
   mediaTypeFromJsonLdType,
 } from "./json-ld";
+import { inventoryScripts } from "./script-scan";
 import type { ScrapedRelease, ScraperDiagnostic, ScraperResult } from "./types";
 
 export interface GenericPressSpec {
@@ -63,6 +64,7 @@ async function scrapeOne(
     htmlBytes: 0,
     fetchedHtmlSample: null,
     nextDataSample: null,
+    scriptInventory: [],
   };
 
   const fetchResult = await fetchHtml(url);
@@ -78,6 +80,7 @@ async function scrapeOne(
   diagnostic.fetched = true;
 
   const root = parseDocument(fetchResult.html);
+  diagnostic.scriptInventory = inventoryScripts(root);
   const releases: ScrapedRelease[] = [];
   const defaultMediaType = spec.defaultMediaType ?? "unknown";
 

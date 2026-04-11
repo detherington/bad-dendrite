@@ -59,6 +59,16 @@ export interface ScraperDiagnostic {
    *  on the page (Netflix Tudum is a Next.js site and puts article
    *  content there). null when the page isn't Next.js. */
   nextDataSample: string | null;
+  /** Inventory of `<script>` tags on the page, so we can see what
+   *  hydration-state mechanism the site actually uses without
+   *  reproducing the request locally. Filtered to scripts with
+   *  non-trivial content and capped at 20. */
+  scriptInventory: Array<{
+    id: string | null;
+    type: string | null;
+    bytes: number;
+    preview: string;
+  }>;
 }
 
 export interface ScraperResult {

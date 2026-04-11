@@ -1152,6 +1152,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
             htmlBytes: 0,
             fetchedHtmlSample: null,
             nextDataSample: null,
+            scriptInventory: [],
           },
         ],
       }),
