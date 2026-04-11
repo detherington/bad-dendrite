@@ -18,6 +18,12 @@ import {
   type SaDiagnostics,
   type SaFetchResult,
 } from "./streaming-availability";
+import {
+  fetchWatchmodeUpcoming,
+  isWatchmodeConfigured,
+  type WatchmodeDiagnostics,
+  type WatchmodeFetchResult,
+} from "./watchmode";
 import { runAllScrapers } from "./scrapers";
 import type {
   ScrapedRelease,
@@ -883,6 +889,7 @@ export interface ReleaseSourceDiagnostics {
     episodes: number;
   };
   streamingAvailability: SaDiagnostics;
+  watchmode: WatchmodeDiagnostics;
   scrapers: {
     perSource: ScraperDiagnostic[];
     injection: {
@@ -1119,7 +1126,35 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     releaseDatesInPast: 0,
     sampleItems: [],
   };
-  const [discoverResults, tvmazeEpisodes, saResult, scraperResult] = await Promise.all([
+  // Empty Watchmode diagnostics shell for graceful fallback when the
+  // call rejects outright -- keeps the shape of the debug response
+  // stable so consumers don't have to handle `undefined` legs.
+  const emptyWatchmodeDiagnostics: WatchmodeDiagnostics = {
+    configured: isWatchmodeConfigured(),
+    callsAttempted: 0,
+    callsSucceeded: 0,
+    callsFailed: 0,
+    rowsReturned: 0,
+    rowsDroppedUnknownSource: 0,
+    rowsDroppedNoTmdbId: 0,
+    rowsDroppedBadType: 0,
+    rowsDroppedBadDate: 0,
+    rowsDroppedOutsideWindow: 0,
+    itemsReturned: 0,
+    perProvider: {},
+    originalsCount: 0,
+    lastError: null,
+    firstResponseKeys: null,
+    firstResponseSample: null,
+    sampleItems: [],
+  };
+  const [
+    discoverResults,
+    tvmazeEpisodes,
+    saResult,
+    watchmodeResult,
+    scraperResult,
+  ] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),
     includeTv
       ? fetchTvmazeWebSchedule(from, to, region).catch(() => [] as TvmazeEpisode[])
@@ -1129,6 +1164,17 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         items: [],
         diagnostics: {
           ...emptySaDiagnostics,
+          callsAttempted: 1,
+          callsFailed: 1,
+          lastError: err instanceof Error ? err.message.slice(0, 500) : String(err),
+        },
+      }),
+    ),
+    fetchWatchmodeUpcoming(from, to).catch(
+      (err): WatchmodeFetchResult => ({
+        items: [],
+        diagnostics: {
+          ...emptyWatchmodeDiagnostics,
           callsAttempted: 1,
           callsFailed: 1,
           lastError: err instanceof Error ? err.message.slice(0, 500) : String(err),
@@ -1160,6 +1206,8 @@ export async function fetchUpcomingReleasesWithDiagnostics(
   ]);
   const saResults = saResult.items;
   const saDiagnostics = saResult.diagnostics;
+  const watchmodeResults = watchmodeResult.items;
+  const watchmodeDiagnostics = watchmodeResult.diagnostics;
   const scrapedReleases = scraperResult.releases;
   const scraperDiagnostics = scraperResult.diagnostics;
 
@@ -1250,6 +1298,45 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         discoveredFrom: new Set(sa.providerIds),
         verifiedOriginal: true,
         saReleaseDate: sa.releaseDate,
+      });
+    }
+  }
+
+  // --- Phase 1a.5: Watchmode injection ------------------------------------
+  // Watchmode's /releases/ endpoint is purpose-built for "upcoming
+  // streaming releases per service" and returns TMDB ids plus actual
+  // streamer release dates directly -- no title search required. We
+  // inject matches exactly like SA but flip `verifiedOriginal` based
+  // on Watchmode's own `is_original` flag (when 1, the title is marked
+  // as a service original so it skips the production_companies filter;
+  // otherwise it flows through the normal originality gate).
+  if (watchmodeResults.length > 0) {
+    for (const wm of watchmodeResults) {
+      const key = `${wm.mediaType}-${wm.tmdbId}`;
+      const existing = candidatesByKey.get(key);
+      if (existing) {
+        for (const pid of wm.providerIds) existing.discoveredFrom.add(pid);
+        if (wm.isOriginal) existing.verifiedOriginal = true;
+        if (wm.releaseDate && !existing.saReleaseDate) {
+          existing.saReleaseDate = wm.releaseDate;
+        }
+        continue;
+      }
+      const stubItem: TmdbDiscoverItem = {
+        id: wm.tmdbId,
+        overview: "",
+        poster_path: null,
+        backdrop_path: null,
+        vote_average: 0,
+        popularity: 0,
+        genre_ids: [],
+      };
+      candidatesByKey.set(key, {
+        mediaType: wm.mediaType,
+        item: stubItem,
+        discoveredFrom: new Set(wm.providerIds),
+        verifiedOriginal: wm.isOriginal,
+        saReleaseDate: wm.releaseDate,
       });
     }
   }
@@ -1685,6 +1772,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       episodes: tvmazeEpisodes.length,
     },
     streamingAvailability: saDiagnostics,
+    watchmode: watchmodeDiagnostics,
     scrapers: {
       perSource: scraperDiagnostics,
       injection: scraperInjectionStats,

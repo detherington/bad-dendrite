@@ -48,6 +48,13 @@ TMDB_REGION=US
 # HBO / Apple TV+ coverage for "coming soon" titles that TMDB hasn't
 # tagged with a regional provider yet.
 STREAMING_AVAILABILITY_API_KEY=<your RapidAPI key>
+
+# Optional: Watchmode API. When set, the app also pulls from
+# Watchmode's /releases/ endpoint, which is purpose-built for
+# "upcoming streaming releases per service" and returns TMDB ids +
+# actual streamer release dates. 1,000 req/mo free tier; we call it
+# once per 24h cache window.
+WATCHMODE_API_KEY=<your Watchmode API key>
 ```
 
 ### Data sources
@@ -61,6 +68,7 @@ source is not configured.
 | TMDB `/discover/movie` + `/discover/tv` | Yes   | Base catalog: per-provider `watch_providers` + production-based `with_networks` + digital `with_release_type=4\|6` passes |
 | TVmaze `/schedule/web`          | No (free, no key) | Weekly episode drops and near-term streaming TV that TMDB's availability layer hasn't flagged yet                         |
 | Streaming Availability (RapidAPI) | No     | Per-provider "coming soon" feed sourced from JustWatch + each service directly. Biggest single coverage lift when enabled. |
+| Watchmode `/releases/`          | No     | Purpose-built upcoming streaming releases feed per service with TMDB ids + actual streamer release dates.                 |
 
 ### 3. Install and run
 
