@@ -838,7 +838,12 @@ export async function fetchUpcomingReleasesWithDiagnostics(
 ): Promise<FetchUpcomingReleasesResult> {
   const region = (opts.region || getRegion()).toUpperCase();
   const daysAhead = opts.daysAhead ?? 90;
-  const maxItems = opts.maxItems ?? 500;
+  // With Streaming Availability contributing hundreds of extra
+  // candidates, the old cap of 500 was slicing off the SA-discovered
+  // Netflix movies before they got details fetched. Raise to 2000 and
+  // rely on verifiedOriginal sorting to keep the most trustworthy
+  // candidates at the top of the list if we ever DO hit the ceiling.
+  const maxItems = opts.maxItems ?? 2000;
   const includeMovies = opts.includeMovies ?? true;
   const includeTv = opts.includeTv ?? true;
 
@@ -1034,11 +1039,26 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     mediaType: MediaType;
     item: TmdbDiscoverItem;
     discoveredFrom: Set<number>;
+    /** True if the candidate was discovered via a source that inherently
+     *  verifies it is an original on one of our streamers:
+     *  `with_companies` (movies), `with_networks` (TV), or the Streaming
+     *  Availability /changes?target_type=upcoming feed. Items with this
+     *  flag skip the post-detail production_companies filter. */
+    verifiedOriginal: boolean;
+    /** Release date hint (YYYY-MM-DD) from Streaming Availability's
+     *  change entry timestamp. Used as the primary movie release date
+     *  when present -- SA knows "X arrives on date Y" more reliably
+     *  than TMDB's crowdsourced release_dates. */
+    saReleaseDate: string | null;
   };
   const candidatesByKey = new Map<string, Candidate>();
   discoverResults.forEach((res, i) => {
     if (res.status !== "fulfilled") return;
     const task = discoverTasks[i];
+    // company / network passes use TMDB's authoritative server-side
+    // filter, so any item they return is by definition an original for
+    // the corresponding streamer.
+    const verifiedByTaskKind = task.companyId != null || task.networkId != null;
     for (const item of res.value.results) {
       const key = `${task.mediaType}-${item.id}`;
       const existing = candidatesByKey.get(key);
@@ -1050,6 +1070,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         if (task.attributedProviderId !== 0) {
           existing.discoveredFrom.add(task.attributedProviderId);
         }
+        if (verifiedByTaskKind) existing.verifiedOriginal = true;
       } else {
         candidatesByKey.set(key, {
           mediaType: task.mediaType,
@@ -1057,22 +1078,29 @@ export async function fetchUpcomingReleasesWithDiagnostics(
           discoveredFrom: new Set(
             task.attributedProviderId !== 0 ? [task.attributedProviderId] : [],
           ),
+          verifiedOriginal: verifiedByTaskKind,
+          saReleaseDate: null,
         });
       }
     }
   });
   // --- Phase 1a': Streaming Availability injection ------------------------
-  // SA returns TMDB ids directly, so we can inject them into candidatesByKey
-  // without a name-search step. For items we've already seen from TMDB
-  // discovery, just merge the provider attribution into discoveredFrom.
-  // For items we haven't, create a stub TmdbDiscoverItem — the downstream
-  // detail fetch will replace every field from the real TMDB response.
+  // SA returns TMDB ids directly AND a reliable "coming on date X"
+  // timestamp per change. We inject matches into candidatesByKey as
+  // verifiedOriginal: true so they skip the downstream production_companies
+  // filter -- SA's /changes?target_type=upcoming has already confirmed the
+  // title is scheduled to land on the service, which is a stronger signal
+  // than TMDB's crowdsourced production_companies field.
   if (saResults.length > 0) {
     for (const sa of saResults) {
       const key = `${sa.mediaType}-${sa.tmdbId}`;
       const existing = candidatesByKey.get(key);
       if (existing) {
         for (const pid of sa.providerIds) existing.discoveredFrom.add(pid);
+        existing.verifiedOriginal = true;
+        if (sa.releaseDate && !existing.saReleaseDate) {
+          existing.saReleaseDate = sa.releaseDate;
+        }
         continue;
       }
       const stubItem: TmdbDiscoverItem = {
@@ -1088,6 +1116,8 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         mediaType: sa.mediaType,
         item: stubItem,
         discoveredFrom: new Set(sa.providerIds),
+        verifiedOriginal: true,
+        saReleaseDate: sa.releaseDate,
       });
     }
   }
@@ -1163,10 +1193,16 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       if (existing) {
         existing.discoveredFrom.add(providerId);
       } else {
+        // TVmaze matches are not authoritative "is this an original" —
+        // they confirm a show has an upcoming episode on the provider's
+        // web channel, which is a strong signal but not equivalent to
+        // production/network tagging. Run the post-detail check.
         candidatesByKey.set(key, {
           mediaType: "tv",
           item: tmdbItem,
           discoveredFrom: new Set([providerId]),
+          verifiedOriginal: false,
+          saReleaseDate: null,
         });
       }
     }
@@ -1175,11 +1211,17 @@ export async function fetchUpcomingReleasesWithDiagnostics(
   const uniqueCandidates = Array.from(candidatesByKey.values());
 
   // --- Phase 2: detail fetches ---------------------------------------------
-  // Keep a hard cap so a very crowded region can't run away, but the cap is
-  // now generous enough to comfortably cover every MAJOR_PROVIDER_IDS entry.
-  const capped = uniqueCandidates.slice(0, maxItems);
+  // Sort so verifiedOriginal candidates come first -- if we ever hit the
+  // cap they're the ones we most want to keep. Within the verified and
+  // unverified groups, preserve insertion order so SA/company/network
+  // candidates (which enter the map first) stay on top.
+  const prioritized = [...uniqueCandidates].sort((a, b) => {
+    if (a.verifiedOriginal === b.verifiedOriginal) return 0;
+    return a.verifiedOriginal ? -1 : 1;
+  });
+  const capped = prioritized.slice(0, maxItems);
 
-  const detailResults = await runWithConcurrency(capped, 15, (c) =>
+  const detailResults = await runWithConcurrency(capped, 25, (c) =>
     fetchDetails(c.mediaType, c.item.id),
   );
 
@@ -1188,7 +1230,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
   // season's videos. Season-level trailers are often stored only on the
   // season endpoint (not the top-level /tv/{id}/videos), which is why
   // "Season 1 Trailer" used to leak through for Season 3 premieres.
-  const seasonVideoResults = await runWithConcurrency(capped, 15, async (c, i) => {
+  const seasonVideoResults = await runWithConcurrency(capped, 25, async (c, i) => {
     if (c.mediaType !== "tv") return null;
     const detail = detailResults[i];
     if (detail.status !== "fulfilled") return null;
@@ -1199,17 +1241,29 @@ export async function fetchUpcomingReleasesWithDiagnostics(
 
   const releases: Release[] = [];
   for (let i = 0; i < capped.length; i++) {
-    const { mediaType, item } = capped[i];
+    const candidate = capped[i];
+    const { mediaType, item } = candidate;
     const detailRes = detailResults[i];
     if (detailRes.status !== "fulfilled") continue;
     const d = detailRes.value;
 
-    // ORIGINALITY GATE: drop anything whose production_companies (movies)
-    // or networks (TV) don't intersect an allowed streamer's declared
-    // original-producing entities. This is the single source of truth
-    // for "is this a streaming original" — watch_providers is purely
-    // informational downstream.
-    const attributedProviderIds = verifyAndAttributeOriginal(d, mediaType);
+    // ORIGINALITY GATE: items flagged `verifiedOriginal` (discovered via
+    // `with_companies`, `with_networks`, or Streaming Availability's
+    // per-provider /changes feed) are trusted -- the discovery source
+    // itself already confirms the title is coming from the streamer,
+    // which is a stronger signal than TMDB's crowdsourced
+    // production_companies field. For those, we use discoveredFrom as
+    // the provider attribution.
+    //
+    // For everything else (availability pass, release-type pass,
+    // TVmaze-discovered), run the post-detail check against
+    // production_companies / networks.
+    let attributedProviderIds: Set<number>;
+    if (candidate.verifiedOriginal) {
+      attributedProviderIds = new Set(candidate.discoveredFrom);
+    } else {
+      attributedProviderIds = verifyAndAttributeOriginal(d, mediaType);
+    }
     if (attributedProviderIds.size === 0) continue;
 
     const baseTitle = d.title || d.name || item.title || item.name || "Untitled";
@@ -1229,10 +1283,17 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     let highlightLabel: string | null = null;
 
     if (mediaType === "movie") {
-      // Use the regional digital/TV release date for display so a movie
-      // that hit cinemas 6 months ago and is now arriving on Netflix shows
-      // its actual streaming date, not its long-past theatrical date.
-      releaseDate = pickMovieReleaseDate(d, region, from, to) ?? undefined;
+      // Prefer Streaming Availability's per-catalog timestamp when we
+      // have one — it's the most reliable "arrives on X on date Y"
+      // signal for upcoming originals. Fall back to TMDB regional
+      // release_dates (digital/TV only) for non-SA candidates and for
+      // SA items whose hint is outside the window.
+      const saDate = candidate.saReleaseDate;
+      if (saDate && saDate >= from && saDate <= to) {
+        releaseDate = saDate;
+      } else {
+        releaseDate = pickMovieReleaseDate(d, region, from, to) ?? undefined;
+      }
       highlightKind = "movie-release";
       highlightLabel = "New Movie";
     } else {
