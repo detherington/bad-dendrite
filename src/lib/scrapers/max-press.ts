@@ -1,7 +1,10 @@
-/** Max (Warner Bros. Discovery) press-site scraper. WBD runs
- *  press.wbd.com and press.hbo.com with media releases that routinely
- *  announce Max premiere dates for originals and day-and-date theatrical
- *  arrivals. */
+/** HBO / Max "What's New / What's Leaving" scraper.
+ *
+ *  Target: https://www.hbo.com/whats-new-whats-leaving
+ *  HBO's own consumer page that lists current and upcoming Max
+ *  additions. Server-rendered for SEO, so the aggressive script
+ *  scanner should find titles + release dates in the embedded
+ *  hydration blob. */
 
 import { scrapeGenericPress } from "./generic-press";
 import type { ScraperResult } from "./types";
@@ -10,12 +13,9 @@ const MAX_PROVIDER_ID = 1899;
 
 export async function scrapeMaxPress(): Promise<ScraperResult> {
   return scrapeGenericPress({
-    source: "max-press",
+    source: "hbo-whats-new",
     providerId: MAX_PROVIDER_ID,
-    urls: [
-      "https://press.wbd.com/us/streaming",
-      "https://press.wbd.com/us/max",
-    ],
+    urls: ["https://www.hbo.com/whats-new-whats-leaving"],
     defaultMediaType: "unknown",
   });
 }

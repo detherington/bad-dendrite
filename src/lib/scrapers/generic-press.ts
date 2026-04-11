@@ -19,7 +19,11 @@ import {
   extractJsonLdEntities,
   mediaTypeFromJsonLdType,
 } from "./json-ld";
-import { inventoryScripts } from "./script-scan";
+import { walkForTitleDatePairs } from "./json-walk";
+import {
+  inventoryScripts,
+  scanScriptsForJsonPayloads,
+} from "./script-scan";
 import type { ScrapedRelease, ScraperDiagnostic, ScraperResult } from "./types";
 
 export interface GenericPressSpec {
@@ -84,14 +88,14 @@ async function scrapeOne(
   const releases: ScrapedRelease[] = [];
   const defaultMediaType = spec.defaultMediaType ?? "unknown";
 
-  // ---- JSON-LD (the only strategy we trust on press pages) -------------
+  // ---- Strategy 1: JSON-LD -----------------------------------------------
   const jsonLdEntities = extractJsonLdEntities(root);
   for (const entity of jsonLdEntities) {
     if (!entity.name || !entity.releaseDate) continue;
     const mediaType = mediaTypeFromJsonLdType(entity.type);
-    // Only accept Movie / TVSeries / TVSeason entities. Press sites
-    // have lots of NewsArticle / Article / BlogPosting entities that
-    // would pollute the candidate pool with press release headlines.
+    // Only accept Movie / TVSeries / TVSeason entities from JSON-LD.
+    // Press sites emit NewsArticle / Article / BlogPosting entities
+    // that would pollute the candidate pool with press release titles.
     if (mediaType === "unknown") continue;
     releases.push({
       title: entity.name,
@@ -105,17 +109,46 @@ async function scrapeOne(
   }
   if (releases.length > 0) diagnostic.parseStrategy = "json-ld";
 
-  // Capture __NEXT_DATA__ sample for debugging (helps tune scrapers for
-  // Next.js-backed press sites where the real content lives in a JSON
-  // blob rather than rendered HTML).
-  const nextDataScript = root.querySelector('script#__NEXT_DATA__');
-  if (nextDataScript?.rawText) {
-    diagnostic.nextDataSample = nextDataScript.rawText.slice(0, 2000);
+  // ---- Strategy 2: aggressive <script> scan -----------------------------
+  // Run the same brute-force scanner used by Netflix Tudum and Apple TV
+  // against every script tag on the page. Any parseable JSON payload
+  // goes through walkForTitleDatePairs, which finds nested objects
+  // carrying {title, releaseDate} pairs regardless of the surrounding
+  // schema. Covers Apollo / Redux / SvelteKit / __NEXT_DATA__ / custom
+  // hydration.
+  const payloads = scanScriptsForJsonPayloads(root);
+  let firstMatchingPayload: string | null = null;
+  let scannedMatches = 0;
+  for (const { value, source } of payloads) {
+    const items = walkForTitleDatePairs(value);
+    if (items.length === 0) continue;
+    if (!firstMatchingPayload) {
+      firstMatchingPayload = source;
+      try {
+        diagnostic.nextDataSample = JSON.stringify(value).slice(0, 2000);
+      } catch {
+        /* ignore */
+      }
+    }
+    scannedMatches += items.length;
+    for (const item of items) {
+      releases.push({
+        title: item.title,
+        year: item.year,
+        releaseDate: item.releaseDate,
+        providerId: spec.providerId,
+        mediaType:
+          item.mediaType !== "unknown" ? item.mediaType : defaultMediaType,
+        source: spec.source,
+        sourceUrl: url,
+      });
+    }
   }
-
-  // `defaultMediaType` is unused now that the heuristic is gone; keep
-  // it on the spec for future strategies and silence the lint.
-  void defaultMediaType;
+  if (scannedMatches > 0) {
+    diagnostic.parseStrategy = diagnostic.parseStrategy
+      ? `${diagnostic.parseStrategy}+script-scan(${firstMatchingPayload})`
+      : `script-scan(${firstMatchingPayload})`;
+  }
 
   diagnostic.itemsFound = releases.length;
   diagnostic.samples = releases.slice(0, 5).map((r) => ({
