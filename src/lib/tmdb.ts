@@ -160,16 +160,77 @@ function toYmd(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-function pickTrailer(videos: TmdbVideo[] | undefined): Trailer | null {
+// Video type -> base score. Types not listed (Behind the Scenes, Bloopers,
+// Opening Credits, etc.) are explicitly rejected so we never surface junk.
+const VIDEO_TYPE_SCORES: Record<string, number> = {
+  Trailer: 2000,
+  Teaser: 1200,
+  Clip: 300,
+  Featurette: 200,
+};
+
+interface PickTrailerOpts {
+  /** When known, prefer videos whose name matches this TV season number. */
+  seasonNumber?: number | null;
+}
+
+function pickTrailer(
+  videos: TmdbVideo[] | undefined,
+  opts: PickTrailerOpts = {},
+): Trailer | null {
   if (!videos || videos.length === 0) return null;
   const youtube = videos.filter((v) => v.site === "YouTube");
-  const trailers = youtube.filter((v) => v.type === "Trailer");
-  const teasers = youtube.filter((v) => v.type === "Teaser");
-  const pool = trailers.length ? trailers : teasers.length ? teasers : youtube;
-  const official = pool.filter((v) => v.official);
-  const chosen = (official.length ? official : pool).sort((a, b) =>
-    (b.published_at || "").localeCompare(a.published_at || ""),
-  )[0];
+  if (youtube.length === 0) return null;
+
+  const now = Date.now();
+  const targetSeason = opts.seasonNumber ?? null;
+
+  // Build a regex that matches a given season number as a whole token, to
+  // avoid "Season 1" matching "Season 10". Examples it matches:
+  //   "Season 3", "season   3", "S3", "S03"
+  const seasonRegex = (n: number) =>
+    new RegExp(`(^|[^a-z0-9])(season\\s*0*${n}|s0*${n})(?![0-9])`, "i");
+
+  function scoreOne(v: TmdbVideo): number {
+    const typeScore = VIDEO_TYPE_SCORES[v.type];
+    if (typeScore == null) return Number.NEGATIVE_INFINITY;
+
+    let score = typeScore;
+
+    if (v.official) score += 250;
+
+    // Recency: linear decay from +200 (today) to 0 (two years old or more).
+    if (v.published_at) {
+      const daysOld = (now - new Date(v.published_at).getTime()) / 86_400_000;
+      score += Math.max(0, 200 - daysOld * (200 / 730));
+    }
+
+    // Season-number matching (TV only).
+    if (targetSeason != null && targetSeason > 0 && v.name) {
+      if (seasonRegex(targetSeason).test(v.name)) {
+        score += 900;
+      } else {
+        // Penalise videos that explicitly reference a DIFFERENT season, so a
+        // leftover "Season 1 Trailer" can't win for a Season 3 premiere.
+        for (let other = 1; other <= 25; other++) {
+          if (other === targetSeason) continue;
+          if (seasonRegex(other).test(v.name)) {
+            score -= 700;
+            break;
+          }
+        }
+      }
+    }
+
+    return score;
+  }
+
+  const ranked = youtube
+    .map((v) => ({ v, score: scoreOne(v) }))
+    .filter((x) => x.score > Number.NEGATIVE_INFINITY)
+    .sort((a, b) => b.score - a.score);
+
+  const chosen = ranked[0]?.v;
   if (!chosen) return null;
   return {
     key: chosen.key,
@@ -273,8 +334,32 @@ async function fetchDetails(mediaType: MediaType, id: number): Promise<TmdbDetai
     params: {
       language: "en-US",
       append_to_response: "videos,credits,watch/providers",
+      // Include videos whose language is English OR unset, so language-tagged
+      // trailers don't get filtered out by the parent language=en-US param.
+      include_video_language: "en,null",
     },
   });
+}
+
+async function fetchSeasonVideos(
+  tvId: number,
+  seasonNumber: number,
+): Promise<TmdbVideo[]> {
+  try {
+    const res = await tmdbFetch<{ id: number; results: TmdbVideo[] }>(
+      `/tv/${tvId}/season/${seasonNumber}/videos`,
+      {
+        params: {
+          language: "en-US",
+          include_video_language: "en,null",
+        },
+      },
+    );
+    return res.results || [];
+  } catch {
+    // Season-videos endpoint 404s for some shows; just fall back silently.
+    return [];
+  }
 }
 
 function dedupeById(releases: Release[]): Release[] {
@@ -353,6 +438,21 @@ export async function fetchUpcomingReleases(
     capped.map((c) => fetchDetails(c.mediaType, c.item.id)),
   );
 
+  // For TV entries whose next event is a specific season, also fetch that
+  // season's videos. Season-level trailers are often stored only on the
+  // season endpoint (not the top-level /tv/{id}/videos), which is why
+  // "Season 1 Trailer" used to leak through for Season 3 premieres.
+  const seasonVideoResults = await Promise.all(
+    capped.map(async (c, i) => {
+      if (c.mediaType !== "tv") return null;
+      const detail = detailResults[i];
+      if (detail.status !== "fulfilled") return null;
+      const season = detail.value.next_episode_to_air?.season_number;
+      if (season == null || season <= 0) return null;
+      return fetchSeasonVideos(c.item.id, season);
+    }),
+  );
+
   const releases: Release[] = [];
   for (let i = 0; i < capped.length; i++) {
     const { mediaType, item } = capped[i];
@@ -419,6 +519,19 @@ export async function fetchUpcomingReleases(
     const popularity = d.popularity ?? item.popularity ?? 0;
     const starPower = computeStarPower(d.credits?.cast);
 
+    // Merge show-level and season-level videos, deduped by video id. Season
+    // videos come first so that when two entries have equal scores, the
+    // season-scoped one wins (tiebreak via sort stability).
+    const showVideos = d.videos?.results ?? [];
+    const seasonVideos = seasonVideoResults[i] ?? [];
+    const mergedVideoMap = new Map<string, TmdbVideo>();
+    for (const v of [...seasonVideos, ...showVideos]) {
+      if (!mergedVideoMap.has(v.id)) mergedVideoMap.set(v.id, v);
+    }
+    const mergedVideos = Array.from(mergedVideoMap.values());
+    const seasonNumber =
+      mediaType === "tv" ? d.next_episode_to_air?.season_number ?? null : null;
+
     releases.push({
       id: `${mediaType}-${d.id}`,
       tmdbId: d.id,
@@ -435,7 +548,7 @@ export async function fetchUpcomingReleases(
       starPower,
       genres: (d.genres || []).map((g) => g.name),
       cast: pickCast(d.credits?.cast),
-      trailer: pickTrailer(d.videos?.results),
+      trailer: pickTrailer(mergedVideos, { seasonNumber }),
       streamingProviders: providers,
       highlightKind,
       highlightLabel,
