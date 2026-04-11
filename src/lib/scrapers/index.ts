@@ -52,6 +52,8 @@ export async function runAllScrapers(): Promise<ScraperResult> {
         samples: [],
         parseStrategy: null,
         htmlBytes: 0,
+        fetchedHtmlSample: null,
+        nextDataSample: null,
       });
     }
   }

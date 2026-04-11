@@ -1,18 +1,19 @@
 /** Generic streamer press-page scraper.
  *
  *  Used by the Disney+, Max, Apple TV+, Prime Video, Peacock, and Hulu
- *  scrapers. Each streamer only configures its URL list and a few
- *  site-specific hints; the heavy lifting (HTML fetch, JSON-LD, heading
- *  + date heuristic) lives here. This keeps per-site code minimal and
- *  lets us iterate the parsing strategies in one place.
+ *  scrapers. Each streamer only configures its URL list; the fetch +
+ *  JSON-LD parse lives here.
  *
- *  Parse strategy order, per URL:
- *    1. JSON-LD schema.org Movie/TVSeries entities on the page.
- *    2. Heuristic walk: find headings that parse as dates, then attach
- *       following list items / title-like nodes to the most recent
- *       date until the next date-heading appears. */
+ *  Design note: an earlier version of this file also ran a
+ *  "heading + date" DOM heuristic as a fallback. In practice that
+ *  heuristic picked up press-release headlines and publish dates on
+ *  press sites instead of actual release schedules (e.g. it returned
+ *  "ESPN Continues Global Expansion on Disney+" dated 2026-04-08 — the
+ *  press article title and publish date, not a release). We've removed
+ *  the fallback entirely: either the page has schema.org data we can
+ *  trust, or we report 0 items and the debug endpoint surfaces the
+ *  HTML sample so we can tune. */
 
-import { parseFreeformDate } from "./date-parse";
 import { fetchHtml, parseDocument } from "./fetch";
 import {
   extractJsonLdEntities,
@@ -60,11 +61,16 @@ async function scrapeOne(
     samples: [],
     parseStrategy: null,
     htmlBytes: 0,
+    fetchedHtmlSample: null,
+    nextDataSample: null,
   };
 
   const fetchResult = await fetchHtml(url);
   diagnostic.httpStatus = fetchResult.status;
   diagnostic.htmlBytes = fetchResult.bytes;
+  if (fetchResult.html) {
+    diagnostic.fetchedHtmlSample = fetchResult.html.slice(0, 2000);
+  }
   if (!fetchResult.ok) {
     diagnostic.error = fetchResult.error ?? "fetch failed";
     return { releases: [], diagnostics: [diagnostic] };
@@ -75,106 +81,38 @@ async function scrapeOne(
   const releases: ScrapedRelease[] = [];
   const defaultMediaType = spec.defaultMediaType ?? "unknown";
 
-  // ---- Strategy 1: JSON-LD ------------------------------------------------
+  // ---- JSON-LD (the only strategy we trust on press pages) -------------
   const jsonLdEntities = extractJsonLdEntities(root);
   for (const entity of jsonLdEntities) {
     if (!entity.name || !entity.releaseDate) continue;
     const mediaType = mediaTypeFromJsonLdType(entity.type);
-    // Press sites sometimes publish Event entities for premieres; if
-    // the type doesn't map cleanly, fall back to the spec's default.
-    const effectiveMediaType =
-      mediaType !== "unknown" ? mediaType : defaultMediaType;
+    // Only accept Movie / TVSeries / TVSeason entities. Press sites
+    // have lots of NewsArticle / Article / BlogPosting entities that
+    // would pollute the candidate pool with press release headlines.
+    if (mediaType === "unknown") continue;
     releases.push({
       title: entity.name,
       year: entity.year,
       releaseDate: entity.releaseDate,
       providerId: spec.providerId,
-      mediaType: effectiveMediaType,
+      mediaType: mediaType,
       source: spec.source,
       sourceUrl: entity.url ?? url,
     });
   }
   if (releases.length > 0) diagnostic.parseStrategy = "json-ld";
 
-  // ---- Strategy 2: heading + date heuristic ------------------------------
-  if (releases.length === 0) {
-    const nodes = root.querySelectorAll(
-      "h1,h2,h3,h4,h5,h6,p,li,div[class*='date' i],time",
-    );
-    let currentDate: string | null = null;
-    for (const node of nodes) {
-      const text = node.text.trim();
-      if (!text || text.length > 240) continue;
-
-      // A `time` element with a datetime attribute is the most reliable
-      // signal — trust it as-is.
-      if (node.tagName === "TIME") {
-        const dt = node.getAttribute("datetime");
-        const ymd = parseFreeformDate(dt || text);
-        if (ymd) {
-          currentDate = ymd;
-          continue;
-        }
-      }
-
-      // Plain text dates: "May 12, 2026", "Friday, May 12", etc.
-      const ymd = parseFreeformDate(text);
-      if (
-        ymd &&
-        /[a-z]/i.test(text) &&
-        text.length < 80 &&
-        /\d/.test(text)
-      ) {
-        currentDate = ymd;
-        continue;
-      }
-
-      if (!currentDate) continue;
-
-      // Candidate title nodes: headings and list items that contain
-      // enough text to look like a title but not so much that they're
-      // paragraphs of description.
-      const isHeadingOrLi =
-        node.tagName === "H2" ||
-        node.tagName === "H3" ||
-        node.tagName === "H4" ||
-        node.tagName === "H5" ||
-        node.tagName === "LI";
-      if (!isHeadingOrLi) continue;
-      if (text.length < 2 || text.length > 120) continue;
-
-      // Skip obvious non-titles: sentences ending with a period, nav
-      // labels, calls-to-action.
-      if (/\.\s*$/.test(text)) continue;
-      if (/^(read more|watch now|coming soon|learn more|subscribe)$/i.test(text)) continue;
-
-      // Strip trailing " — Series" / "(Movie)" etc to normalise titles.
-      const title = text
-        .replace(/\s*[—\-–]\s*(movie|series|limited series|film|special|documentary)\s*$/i, "")
-        .trim();
-      if (!title) continue;
-
-      const mediaTypeHint = /series|season|episodes?/i.test(text)
-        ? "tv"
-        : /film|movie|documentary/i.test(text)
-          ? "movie"
-          : defaultMediaType;
-
-      releases.push({
-        title,
-        releaseDate: currentDate,
-        providerId: spec.providerId,
-        mediaType: mediaTypeHint,
-        source: spec.source,
-        sourceUrl: url,
-      });
-    }
-    if (releases.length > 0) {
-      diagnostic.parseStrategy = diagnostic.parseStrategy
-        ? `${diagnostic.parseStrategy}+headings`
-        : "headings";
-    }
+  // Capture __NEXT_DATA__ sample for debugging (helps tune scrapers for
+  // Next.js-backed press sites where the real content lives in a JSON
+  // blob rather than rendered HTML).
+  const nextDataScript = root.querySelector('script#__NEXT_DATA__');
+  if (nextDataScript?.rawText) {
+    diagnostic.nextDataSample = nextDataScript.rawText.slice(0, 2000);
   }
+
+  // `defaultMediaType` is unused now that the heuristic is gone; keep
+  // it on the spec for future strategies and silence the lint.
+  void defaultMediaType;
 
   diagnostic.itemsFound = releases.length;
   diagnostic.samples = releases.slice(0, 5).map((r) => ({

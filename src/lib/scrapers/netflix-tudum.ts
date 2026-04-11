@@ -1,19 +1,25 @@
-/** Netflix Tudum scraper — parses the weekly "Coming to Netflix" article
- *  at netflix.com/tudum/articles/new-on-netflix to get scheduled Netflix
- *  additions. This is Netflix's own editorial source of truth and gets
- *  updated throughout the month.
+/** Netflix Tudum scraper.
+ *
+ *  Netflix's own editorial site (netflix.com/tudum) publishes monthly
+ *  "Coming to Netflix" articles. The main landing page at
+ *  /tudum/articles/new-on-netflix redirects to or renders whichever
+ *  article is current. Tudum is built on Next.js, so the article
+ *  content is present in the page as a serialised `__NEXT_DATA__`
+ *  blob — even when the rendered HTML doesn't expose a clean
+ *  schema.org outline.
  *
  *  Parse strategies, in order:
- *    1. JSON-LD entities on the article page (schema.org Article +
- *       optional itemList).
- *    2. Text pattern matching: repeating "Month Day, Year" headers
- *       followed by title lines, which is how Tudum structures the
- *       editorial copy when React is server-rendered for SEO.
+ *    1. JSON-LD entities (Movie / TVSeries).
+ *    2. __NEXT_DATA__ JSON tree walk: find every nested object that
+ *       carries a plausible `{ title, releaseDate }` pair. This is how
+ *       we get the actual editorial list of upcoming titles.
  *
- *  If both strategies return zero items, diagnostics.parseStrategy stays
- *  null and the caller can see that we need site-specific tuning. */
+ *  Diagnostics capture:
+ *    - `fetchedHtmlSample`: first 2000 chars of the raw HTML.
+ *    - `nextDataSample`: first 2000 chars of the parsed __NEXT_DATA__
+ *      payload (when present). The next debug run will show exactly
+ *      what shape Tudum uses so we can tighten the extractor. */
 
-import { parseFreeformDate } from "./date-parse";
 import { fetchHtml, parseDocument } from "./fetch";
 import {
   extractJsonLdEntities,
@@ -37,11 +43,16 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
     samples: [],
     parseStrategy: null,
     htmlBytes: 0,
+    fetchedHtmlSample: null,
+    nextDataSample: null,
   };
 
   const fetchResult = await fetchHtml(TUDUM_URL);
   diagnostic.httpStatus = fetchResult.status;
   diagnostic.htmlBytes = fetchResult.bytes;
+  if (fetchResult.html) {
+    diagnostic.fetchedHtmlSample = fetchResult.html.slice(0, 2000);
+  }
   if (!fetchResult.ok) {
     diagnostic.error = fetchResult.error ?? "fetch failed";
     return { releases: [], diagnostics: [diagnostic] };
@@ -69,90 +80,174 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
   }
   if (releases.length > 0) diagnostic.parseStrategy = "json-ld";
 
-  // ---- Strategy 2: heading + title text heuristic ------------------------
-  // Tudum's "new on Netflix" editorial copy follows a repeating pattern:
-  //
-  //     <h2>Coming to Netflix on <Weekday>, <Month> <Day></h2>
-  //     <h3><em>Title</em> — (Movie / Series / Limited Series)</h3>
-  //     ...
-  //
-  // We walk the article body in document order and, every time we
-  // encounter a heading that parses as a date, attribute all following
-  // title-like headings to that date until we see the next one.
-  if (releases.length === 0) {
-    const article =
-      root.querySelector("article") ||
-      root.querySelector('[data-uia="article-body"]') ||
-      root;
-    const nodes = article.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li");
-
-    let currentDate: string | null = null;
-    for (const node of nodes) {
-      const text = node.text.trim();
-      if (!text) continue;
-
-      // Is this heading a date? Try two forms: "Coming to Netflix on
-      // Friday, May 12" (inline prefix) and a bare "Friday, May 12".
-      const dateMatch =
-        /\b(coming to netflix on|available (?:on )?|premier(?:e|ing) on|launch(?:es|ing)? on)\s+([a-z]+,\s*[a-z]+\s+\d{1,2}(?:,\s*\d{4})?)/i.exec(
-          text,
-        ) ||
-        /^((?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,\s*[a-z]+\s+\d{1,2}(?:,\s*\d{4})?)/i.exec(
-          text,
-        );
-      if (dateMatch) {
-        const datePart = dateMatch[dateMatch.length - 1];
-        const ymd = parseFreeformDate(datePart);
-        if (ymd) {
-          currentDate = ymd;
-          continue;
-        }
+  // ---- Strategy 2: __NEXT_DATA__ tree walk -------------------------------
+  // Netflix Tudum is a Next.js site. The article body is serialised into
+  // a <script id="__NEXT_DATA__"> JSON blob for hydration. We recursively
+  // walk the tree looking for objects with a plausible (title, date)
+  // pair, which covers most ways Tudum could represent a "coming soon"
+  // list regardless of its specific schema.
+  const nextDataScript = root.querySelector('script#__NEXT_DATA__');
+  if (nextDataScript?.rawText) {
+    diagnostic.nextDataSample = nextDataScript.rawText.slice(0, 2000);
+    try {
+      const parsed = JSON.parse(nextDataScript.rawText);
+      const walked = walkForTitleDatePairs(parsed);
+      for (const item of walked) {
+        releases.push({
+          title: item.title,
+          year: item.year,
+          releaseDate: item.releaseDate,
+          providerId: NETFLIX_PROVIDER_ID,
+          mediaType: item.mediaType,
+          source: SOURCE,
+          sourceUrl: TUDUM_URL,
+        });
       }
-
-      // If we haven't locked a date yet, skip this node.
-      if (!currentDate) continue;
-
-      // Look for lines that look like "Title — Movie" / "Title (Series)".
-      // Tudum typically wraps the title in <em> or <i> inside the heading.
-      const italic =
-        node.querySelector("em")?.text?.trim() ||
-        node.querySelector("i")?.text?.trim();
-      if (!italic) continue;
-
-      const mediaTypeHint = /series|season/i.test(text)
-        ? "tv"
-        : /film|movie/i.test(text)
-          ? "movie"
-          : "unknown";
-
-      // Strip trailing "— Series", "(Limited Series)", etc.
-      const title = italic
-        .replace(/\s*[—\-–]\s*(movie|series|limited series|film|special)\s*$/i, "")
-        .trim();
-      if (!title) continue;
-
-      releases.push({
-        title,
-        releaseDate: currentDate,
-        providerId: NETFLIX_PROVIDER_ID,
-        mediaType: mediaTypeHint,
-        source: SOURCE,
-        sourceUrl: TUDUM_URL,
-      });
-    }
-    if (releases.length > 0) {
-      diagnostic.parseStrategy = diagnostic.parseStrategy
-        ? `${diagnostic.parseStrategy}+headings`
-        : "headings";
+      if (walked.length > 0) {
+        diagnostic.parseStrategy = diagnostic.parseStrategy
+          ? `${diagnostic.parseStrategy}+next-data`
+          : "next-data";
+      }
+    } catch (err) {
+      diagnostic.error = `__NEXT_DATA__ parse failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`;
     }
   }
 
-  diagnostic.itemsFound = releases.length;
-  diagnostic.samples = releases.slice(0, 5).map((r) => ({
+  // Dedupe by (normalised title, releaseDate) since both strategies may
+  // surface the same entry.
+  const deduped = dedupeReleases(releases);
+
+  diagnostic.itemsFound = deduped.length;
+  diagnostic.samples = deduped.slice(0, 5).map((r) => ({
     title: r.title,
     releaseDate: r.releaseDate,
     mediaType: r.mediaType,
   }));
 
-  return { releases, diagnostics: [diagnostic] };
+  return { releases: deduped, diagnostics: [diagnostic] };
+}
+
+// ---------- JSON tree walking ----------
+
+interface WalkedItem {
+  title: string;
+  releaseDate: string;
+  year?: number;
+  mediaType: "movie" | "tv" | "unknown";
+}
+
+const TITLE_KEYS = new Set([
+  "title",
+  "name",
+  "headline",
+  "displayTitle",
+  "displayName",
+]);
+
+const DATE_KEYS = new Set([
+  "releaseDate",
+  "availableDate",
+  "availableFrom",
+  "premiereDate",
+  "premiere_date",
+  "launchDate",
+  "launch_date",
+  "airDate",
+  "air_date",
+  "date",
+  "publishedDate",
+  "published_at",
+  "datePublished",
+]);
+
+function pickStringField(obj: Record<string, unknown>, keys: Set<string>): string | null {
+  for (const k of Object.keys(obj)) {
+    if (!keys.has(k)) continue;
+    const v = obj[k];
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+  }
+  return null;
+}
+
+function normaliseDateStringLocal(raw: string): string | null {
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+  return null;
+}
+
+function looksLikeTitle(candidate: string): boolean {
+  const trimmed = candidate.trim();
+  if (trimmed.length < 2 || trimmed.length > 200) return false;
+  // Reject things that look like URLs, slugs, or sentences.
+  if (/^https?:\/\//.test(trimmed)) return false;
+  if (/\/[a-z0-9-]+\//.test(trimmed) && !/\s/.test(trimmed)) return false;
+  return true;
+}
+
+function walkForTitleDatePairs(root: unknown): WalkedItem[] {
+  const out: WalkedItem[] = [];
+  const seen = new Set<unknown>();
+
+  function visit(node: unknown): void {
+    if (!node) return;
+    if (typeof node !== "object") return;
+    if (seen.has(node)) return;
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+
+    const obj = node as Record<string, unknown>;
+    const titleRaw = pickStringField(obj, TITLE_KEYS);
+    const dateRaw = pickStringField(obj, DATE_KEYS);
+    if (titleRaw && dateRaw && looksLikeTitle(titleRaw)) {
+      const normalised = normaliseDateStringLocal(dateRaw);
+      if (normalised) {
+        // Infer media type from any `type`, `contentType`, or
+        // `category` field on the same object.
+        const typeField =
+          pickStringField(obj, new Set(["type", "contentType", "category", "__typename"]))
+            ?.toLowerCase() ?? "";
+        const mediaType: "movie" | "tv" | "unknown" =
+          /series|season|episode|show/.test(typeField)
+            ? "tv"
+            : /movie|film|feature/.test(typeField)
+              ? "movie"
+              : "unknown";
+        out.push({
+          title: titleRaw,
+          releaseDate: normalised,
+          mediaType,
+          year: parseInt(normalised.slice(0, 4), 10) || undefined,
+        });
+      }
+    }
+
+    for (const key of Object.keys(obj)) visit(obj[key]);
+  }
+
+  visit(root);
+  return out;
+}
+
+// ---------- Dedupe ----------
+
+function dedupeReleases(list: ScrapedRelease[]): ScrapedRelease[] {
+  const seen = new Set<string>();
+  const out: ScrapedRelease[] = [];
+  for (const r of list) {
+    const key = `${r.title.toLowerCase().replace(/[^a-z0-9]+/g, "")}::${r.releaseDate}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
 }

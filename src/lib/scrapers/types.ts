@@ -50,6 +50,15 @@ export interface ScraperDiagnostic {
   /** HTML size in bytes, so we can tell whether the page was blocked
    *  (small body, e.g. Cloudflare challenge) or fetched normally. */
   htmlBytes: number;
+  /** First ~2000 chars of the fetched HTML, for eyeballing in the debug
+   *  endpoint when a scraper returns zero items despite a successful
+   *  fetch. Lets us confirm the page structure without needing to
+   *  reproduce the request locally. */
+  fetchedHtmlSample: string | null;
+  /** First ~2000 chars of the `__NEXT_DATA__` JSON payload if present
+   *  on the page (Netflix Tudum is a Next.js site and puts article
+   *  content there). null when the page isn't Next.js. */
+  nextDataSample: string | null;
 }
 
 export interface ScraperResult {

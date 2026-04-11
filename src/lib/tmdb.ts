@@ -1150,6 +1150,8 @@ export async function fetchUpcomingReleasesWithDiagnostics(
             samples: [],
             parseStrategy: null,
             htmlBytes: 0,
+            fetchedHtmlSample: null,
+            nextDataSample: null,
           },
         ],
       }),
