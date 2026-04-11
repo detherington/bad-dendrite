@@ -102,6 +102,18 @@ function isYmd(raw: string | undefined): raw is string {
   return typeof raw === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw);
 }
 
+/** Watchmode's `poster_url` is typically a full TMDB CDN URL like
+ *  `https://image.tmdb.org/t/p/w185/abc123.jpg`. Strip the scheme,
+ *  host, and size segment to extract just the path portion (`/abc123.jpg`)
+ *  so it can be used with our existing `tmdbImage(path, size)` helper,
+ *  which prepends its own base + size. Returns null for non-TMDB URLs
+ *  (rare) or when the URL is missing. */
+function extractTmdbPosterPath(url: string | null | undefined): string | null {
+  if (!url) return null;
+  const match = /^https?:\/\/image\.tmdb\.org\/t\/p\/[^/]+(\/[^?#]+)/.exec(url);
+  return match ? match[1] : null;
+}
+
 async function watchmodeFetch<T>(
   path: string,
   params: Record<string, string>,
@@ -147,6 +159,17 @@ export interface WatchmodeUpcoming {
    *  verifiedOriginal bit on the injected candidate so it skips the
    *  production_companies filter. */
   isOriginal: boolean;
+  /** TMDB poster path extracted from Watchmode's `poster_url` field
+   *  (e.g. `/abc123.jpg`). Used as a fallback when the downstream
+   *  TMDB detail fetch returns no poster_path for the title. Null
+   *  when Watchmode has no poster either. */
+  posterPath: string | null;
+  /** Season number from Watchmode when the release row is for a
+   *  specific season (e.g. Season 2 drop of an ongoing show). Used
+   *  downstream to fetch season-specific poster art when the show-
+   *  level poster is missing. Null for movies and for series where
+   *  Watchmode doesn't specify a season. */
+  seasonNumber: number | null;
 }
 
 /** Diagnostics captured during one Watchmode /releases sweep. Surfaced
@@ -291,6 +314,11 @@ export async function fetchWatchmodeUpcoming(
     }
 
     const isOriginal = row.is_original === 1;
+    const posterPath = extractTmdbPosterPath(row.poster_url);
+    const seasonNumber =
+      typeof row.season_number === "number" && row.season_number > 0
+        ? row.season_number
+        : null;
     const key = `${mediaType}-${row.tmdb_id}`;
     const existing = merged.get(key);
     if (existing) {
@@ -299,6 +327,18 @@ export async function fetchWatchmodeUpcoming(
         existing.releaseDate = releaseDate;
       }
       if (isOriginal) existing.isOriginal = true;
+      // Prefer the highest season number we see, on the assumption
+      // that Watchmode is listing the newest drop when multiple rows
+      // exist for the same TMDB id.
+      if (
+        seasonNumber != null &&
+        (existing.seasonNumber == null || seasonNumber > existing.seasonNumber)
+      ) {
+        existing.seasonNumber = seasonNumber;
+      }
+      if (posterPath && !existing.posterPath) {
+        existing.posterPath = posterPath;
+      }
     } else {
       merged.set(key, {
         mediaType,
@@ -306,6 +346,8 @@ export async function fetchWatchmodeUpcoming(
         providerIds: new Set([tmdbProviderId]),
         releaseDate,
         isOriginal,
+        posterPath,
+        seasonNumber,
       });
     }
   }

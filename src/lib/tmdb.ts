@@ -186,6 +186,27 @@ interface TmdbNetworkRef {
   origin_country?: string;
 }
 
+/** One image row from TMDB's `/images` endpoint. TMDB returns these
+ *  for every appendable media kind (movies, TV, seasons). We only
+ *  touch the file_path, language, and vote_average fields — the rest
+ *  (width/height/aspect_ratio/vote_count) are diagnostic.
+ *
+ *  `iso_639_1` is the image's language code. An English poster has
+ *  `"en"`, a language-neutral poster (no text, international art) has
+ *  `null`, and everything else is the localised variant. */
+interface TmdbImage {
+  file_path: string;
+  iso_639_1: string | null;
+  vote_average?: number;
+  width?: number;
+  height?: number;
+}
+
+interface TmdbImages {
+  posters?: TmdbImage[];
+  backdrops?: TmdbImage[];
+}
+
 interface TmdbDetails {
   id: number;
   title?: string;
@@ -208,6 +229,11 @@ interface TmdbDetails {
   credits?: { cast: TmdbCastEntry[] };
   release_dates?: { results: TmdbReleaseDatesRegion[] };
   "watch/providers"?: { results: Record<string, TmdbWatchProviderRegion> };
+  /** Populated via append_to_response=images. Contains posters and
+   *  backdrops in any of the languages we pass via include_image_language
+   *  (en, null, and the original language). Used as the fallback when
+   *  the default localised `poster_path` is null. */
+  images?: TmdbImages;
 }
 
 // ---------- Helpers ----------
@@ -227,6 +253,60 @@ const VIDEO_TYPE_SCORES: Record<string, number> = {
   Clip: 300,
   Featurette: 200,
 };
+
+/** Pick the best poster file_path from the `/images` endpoint's posters
+ *  array. Used as a fallback when `d.poster_path` is null (common for
+ *  very new entries and international titles where TMDB has posters but
+ *  only in non-English languages that `language=en-US` hides).
+ *
+ *  Preference:
+ *    1. English-language poster — matches what the user would see in a
+ *       US-locale browser.
+ *    2. Language-neutral poster (iso_639_1 === null) — international art
+ *       with no text; always looks fine.
+ *    3. Any remaining poster — a non-English poster is vastly better
+ *       than no poster.
+ *
+ *  Within each language tier, pick the one with the highest vote_average
+ *  (community-curated quality signal). */
+function pickPosterFromImages(images: TmdbImages | undefined): string | null {
+  if (!images?.posters?.length) return null;
+  let bestEn: TmdbImage | null = null;
+  let bestNull: TmdbImage | null = null;
+  let bestAny: TmdbImage | null = null;
+  for (const p of images.posters) {
+    if (!p.file_path) continue;
+    const score = p.vote_average ?? 0;
+    if (p.iso_639_1 === "en") {
+      if (!bestEn || score > (bestEn.vote_average ?? 0)) bestEn = p;
+    } else if (p.iso_639_1 == null) {
+      if (!bestNull || score > (bestNull.vote_average ?? 0)) bestNull = p;
+    } else {
+      if (!bestAny || score > (bestAny.vote_average ?? 0)) bestAny = p;
+    }
+  }
+  return (bestEn ?? bestNull ?? bestAny)?.file_path ?? null;
+}
+
+/** Same logic as pickPosterFromImages but for backdrops. */
+function pickBackdropFromImages(images: TmdbImages | undefined): string | null {
+  if (!images?.backdrops?.length) return null;
+  let bestEn: TmdbImage | null = null;
+  let bestNull: TmdbImage | null = null;
+  let bestAny: TmdbImage | null = null;
+  for (const b of images.backdrops) {
+    if (!b.file_path) continue;
+    const score = b.vote_average ?? 0;
+    if (b.iso_639_1 === "en") {
+      if (!bestEn || score > (bestEn.vote_average ?? 0)) bestEn = b;
+    } else if (b.iso_639_1 == null) {
+      if (!bestNull || score > (bestNull.vote_average ?? 0)) bestNull = b;
+    } else {
+      if (!bestAny || score > (bestAny.vote_average ?? 0)) bestAny = b;
+    }
+  }
+  return (bestEn ?? bestNull ?? bestAny)?.file_path ?? null;
+}
 
 interface PickTrailerOpts {
   /** When known, prefer videos whose name matches this TV season number. */
@@ -600,6 +680,23 @@ const ALLOWED_PROVIDER_NAME_BY_ID = new Map<number, string>(
   ALLOWED_PROVIDERS.map((p) => [p.id, p.name]),
 );
 
+/** Hardcoded TMDB logo_path for each allowed provider. Used as a
+ *  fallback when a provider is attributed via company/network/SA/
+ *  Watchmode but the title hasn't been tagged in TMDB's
+ *  `watch/providers` response yet (so `pickProviders` returns nothing
+ *  for this provider_id and the logo would otherwise be null, leaving
+ *  the UI to render initials like "Ne" or "Di"). These paths are
+ *  stable TMDB CDN asset ids. */
+const ALLOWED_PROVIDER_LOGO: Record<number, string> = {
+  8: "/pbpMk2JmcoNnQwx5JGpXngfoWtp.jpg", // Netflix
+  350: "/6uhKBfmtzFqOcLousHwZuzcrScK.jpg", // Apple TV+
+  337: "/7rwgEs15tFwyR9NPQ5vpzxTj19Q.jpg", // Disney+
+  9: "/emthp39XA2YScoYL1p0sdbAH2WA.jpg", // Amazon Prime Video
+  15: "/zxrVdFjIjLqkfnwyghnfywTn3Lh.jpg", // Hulu
+  386: "/xTHltMrZPAJFLQ6qyCBjAnXSmZt.jpg", // Peacock
+  1899: "/6Q3KKKLC5RlFhubXgazRgN1a2Jb.jpg", // Max
+};
+
 /** Bounded-concurrency runner so we don't blast TMDB with hundreds of
  *  parallel requests and get rate-limited. */
 async function runWithConcurrency<T, R>(
@@ -718,9 +815,16 @@ async function fetchDetails(mediaType: MediaType, id: number): Promise<TmdbDetai
   const endpoint = mediaType === "movie" ? `/movie/${id}` : `/tv/${id}`;
   // Movies also pull `release_dates` so we can pick the regional digital/TV
   // release for display instead of the primary (theatrical) date.
+  //
+  // `images` is always appended so we can fall back to a non-English
+  // poster when the localised `poster_path` is null. Very new or
+  // international titles often have posters tagged with the original
+  // language but not English — the default `poster_path` on a
+  // `language=en-US` detail response can be null in those cases, but
+  // `images.posters` typically still has entries we can use.
   const append = mediaType === "movie"
-    ? "videos,credits,watch/providers,release_dates"
-    : "videos,credits,watch/providers";
+    ? "videos,credits,watch/providers,release_dates,images"
+    : "videos,credits,watch/providers,images";
   return tmdbFetch<TmdbDetails>(endpoint, {
     params: {
       language: "en-US",
@@ -728,6 +832,13 @@ async function fetchDetails(mediaType: MediaType, id: number): Promise<TmdbDetai
       // Include videos whose language is English OR unset, so language-tagged
       // trailers don't get filtered out by the parent language=en-US param.
       include_video_language: "en,null",
+      // Include posters/backdrops whose language is English, unset
+      // (language-neutral international art), or the title's original
+      // language. `xx` is TMDB's wildcard-ish accept for any language —
+      // using it via `null,en,xx`-style comma lists would conflict with
+      // `null`, so we pass en + null + the big-coverage languages we
+      // care about most for our region scope.
+      include_image_language: "en,null",
     },
   });
 }
@@ -1230,6 +1341,10 @@ export async function fetchUpcomingReleasesWithDiagnostics(
      *  when present -- SA knows "X arrives on date Y" more reliably
      *  than TMDB's crowdsourced release_dates. */
     saReleaseDate: string | null;
+    /** Season number from Watchmode for TV rows that reference a
+     *  specific season drop. Used as a hint when fetching season-
+     *  level poster art to fill in a missing show-level poster. */
+    watchmodeSeasonNumber: number | null;
   };
   const candidatesByKey = new Map<string, Candidate>();
   discoverResults.forEach((res, i) => {
@@ -1260,6 +1375,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
           ),
           verifiedOriginal: verifiedByTaskKind,
           saReleaseDate: null,
+          watchmodeSeasonNumber: null,
         });
       }
     }
@@ -1298,6 +1414,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         discoveredFrom: new Set(sa.providerIds),
         verifiedOriginal: true,
         saReleaseDate: sa.releaseDate,
+        watchmodeSeasonNumber: null,
       });
     }
   }
@@ -1328,12 +1445,20 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         if (wm.releaseDate && !existing.saReleaseDate) {
           existing.saReleaseDate = wm.releaseDate;
         }
+        // Backfill the discover stub's poster_path from Watchmode
+        // when TMDB discovery didn't carry one. Harmless when it did.
+        if (wm.posterPath && !existing.item.poster_path) {
+          existing.item.poster_path = wm.posterPath;
+        }
+        if (wm.seasonNumber != null && existing.watchmodeSeasonNumber == null) {
+          existing.watchmodeSeasonNumber = wm.seasonNumber;
+        }
         continue;
       }
       const stubItem: TmdbDiscoverItem = {
         id: wm.tmdbId,
         overview: "",
-        poster_path: null,
+        poster_path: wm.posterPath,
         backdrop_path: null,
         vote_average: 0,
         popularity: 0,
@@ -1345,6 +1470,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         discoveredFrom: new Set(wm.providerIds),
         verifiedOriginal: true,
         saReleaseDate: wm.releaseDate,
+        watchmodeSeasonNumber: wm.seasonNumber,
       });
     }
   }
@@ -1420,6 +1546,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
           discoveredFrom: new Set([scraped.providerId]),
           verifiedOriginal: true,
           saReleaseDate: scraped.releaseDate,
+          watchmodeSeasonNumber: null,
         });
         scraperInjectionStats.addedNew++;
       }
@@ -1507,6 +1634,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
           discoveredFrom: new Set([providerId]),
           verifiedOriginal: false,
           saReleaseDate: null,
+          watchmodeSeasonNumber: null,
         });
       }
     }
@@ -1529,18 +1657,57 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     fetchDetails(c.mediaType, c.item.id),
   );
 
-  // --- Phase 3: season-level videos (TV only) ------------------------------
+  // --- Phase 3: season-level videos + poster fallback (TV only) -----------
   // For TV entries whose next event is a specific season, also fetch that
   // season's videos. Season-level trailers are often stored only on the
   // season endpoint (not the top-level /tv/{id}/videos), which is why
   // "Season 1 Trailer" used to leak through for Season 3 premieres.
-  const seasonVideoResults = await runWithConcurrency(capped, 25, async (c, i) => {
+  //
+  // Additionally, when the show-level poster_path is still null after
+  // the images fallback, fetch `/tv/{id}/season/{n}` — which carries
+  // `poster_path` — and use its poster. Season art is often uploaded
+  // before the show-level art for new series.
+  type SeasonExtra = {
+    videos: TmdbVideo[];
+    seasonPosterPath: string | null;
+  };
+  const seasonVideoResults = await runWithConcurrency(capped, 25, async (c, i): Promise<SeasonExtra | null> => {
     if (c.mediaType !== "tv") return null;
     const detail = detailResults[i];
     if (detail.status !== "fulfilled") return null;
-    const season = detail.value.next_episode_to_air?.season_number;
+    const season =
+      detail.value.next_episode_to_air?.season_number ??
+      c.watchmodeSeasonNumber;
     if (season == null || season <= 0) return null;
-    return fetchSeasonVideos(c.item.id, season);
+    const hasPoster =
+      detail.value.poster_path != null ||
+      pickPosterFromImages(detail.value.images) != null ||
+      c.item.poster_path != null;
+    // If we already have a poster, only fetch videos.
+    if (hasPoster) {
+      const videos = await fetchSeasonVideos(c.item.id, season);
+      return { videos, seasonPosterPath: null };
+    }
+    // No poster yet: fetch the full season detail (which includes
+    // poster_path AND videos) in one shot via append_to_response.
+    try {
+      const res = await tmdbFetch<{
+        poster_path?: string | null;
+        videos?: { results: TmdbVideo[] };
+      }>(`/tv/${c.item.id}/season/${season}`, {
+        params: {
+          language: "en-US",
+          append_to_response: "videos",
+          include_video_language: "en,null",
+        },
+      });
+      return {
+        videos: res.videos?.results ?? [],
+        seasonPosterPath: res.poster_path ?? null,
+      };
+    } catch {
+      return null;
+    }
   });
 
   // Counters for the release-loop drop reasons. Threaded into the
@@ -1745,7 +1912,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         providerMap.set(id, {
           id,
           name: ALLOWED_PROVIDER_NAME_BY_ID.get(id) ?? `Provider ${id}`,
-          logoPath: null,
+          logoPath: ALLOWED_PROVIDER_LOGO[id] ?? null,
         });
       }
     }
@@ -1774,17 +1941,34 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     // season-scoped one wins (tiebreak via sort stability).
     const showVideos = d.videos?.results ?? [];
     const seasonVideoRes = seasonVideoResults[i];
-    const seasonVideos =
-      seasonVideoRes?.status === "fulfilled" && seasonVideoRes.value
-        ? seasonVideoRes.value
-        : [];
+    const seasonExtra: SeasonExtra | null =
+      seasonVideoRes?.status === "fulfilled" ? seasonVideoRes.value : null;
+    const seasonVideos = seasonExtra?.videos ?? [];
     const mergedVideoMap = new Map<string, TmdbVideo>();
     for (const v of [...seasonVideos, ...showVideos]) {
       if (!mergedVideoMap.has(v.id)) mergedVideoMap.set(v.id, v);
     }
     const mergedVideos = Array.from(mergedVideoMap.values());
     const seasonNumber =
-      mediaType === "tv" ? d.next_episode_to_air?.season_number ?? null : null;
+      mediaType === "tv"
+        ? d.next_episode_to_air?.season_number ?? candidate.watchmodeSeasonNumber ?? null
+        : null;
+
+    // Poster resolution order:
+    //   1. d.poster_path — TMDB detail's localised poster (en-US)
+    //   2. images fallback — picks best available from /images append
+    //   3. season poster — from /tv/{id}/season/{n} (new shows often
+    //      have season art before the show-level poster)
+    //   4. item.poster_path — discover stub / Watchmode's poster_url
+    const posterPath =
+      d.poster_path ??
+      pickPosterFromImages(d.images) ??
+      seasonExtra?.seasonPosterPath ??
+      item.poster_path;
+    const backdropPath =
+      d.backdrop_path ??
+      pickBackdropFromImages(d.images) ??
+      item.backdrop_path;
 
     releases.push({
       id: `${mediaType}-${d.id}`,
@@ -1795,8 +1979,8 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       overview: d.overview || item.overview || "",
       releaseDate,
       releaseTime: null, // TMDB doesn't expose a per-region time
-      posterPath: d.poster_path ?? item.poster_path,
-      backdropPath: d.backdrop_path ?? item.backdrop_path,
+      posterPath,
+      backdropPath,
       voteAverage: d.vote_average ?? item.vote_average ?? 0,
       popularity,
       starPower,
