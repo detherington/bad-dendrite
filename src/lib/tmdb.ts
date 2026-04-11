@@ -300,20 +300,29 @@ export interface FetchReleasesOptions {
  * filtering are all scoped to this set. Adding/removing an entry changes
  * what users see AND how deep the catalog scan goes (fewer providers ==
  * more pages per provider within the same API budget).
+ *
+ * Each provider can also declare `tvNetworkIds`, which are TMDB TV network
+ * IDs that correspond to the service's originals. We use those for a second
+ * discovery pass (`with_networks=<id>`) to catch upcoming shows that aren't
+ * yet flagged with regional watch_providers data -- TMDB's per-region
+ * availability tagging lags for unreleased titles, but the network tag is
+ * set at the show record itself and is populated as soon as the show is
+ * entered in TMDB.
  */
 interface AllowedProvider {
   id: number;
   name: string;
+  tvNetworkIds?: ReadonlyArray<number>;
 }
 
 const ALLOWED_PROVIDERS: ReadonlyArray<AllowedProvider> = [
-  { id: 8, name: "Netflix" },
-  { id: 350, name: "Apple TV+" },
-  { id: 337, name: "Disney+" },
-  { id: 9, name: "Amazon Prime Video" },
-  { id: 15, name: "Hulu" },
-  { id: 386, name: "Peacock Premium" },
-  { id: 1899, name: "Max" },
+  { id: 8, name: "Netflix", tvNetworkIds: [213] },
+  { id: 350, name: "Apple TV+", tvNetworkIds: [2552] },
+  { id: 337, name: "Disney+", tvNetworkIds: [2739] },
+  { id: 9, name: "Amazon Prime Video", tvNetworkIds: [1024] },
+  { id: 15, name: "Hulu", tvNetworkIds: [453] },
+  { id: 386, name: "Peacock Premium", tvNetworkIds: [3353] },
+  { id: 1899, name: "Max", tvNetworkIds: [49, 3186] },
 ];
 
 const ALLOWED_PROVIDER_IDS: ReadonlyArray<number> = ALLOWED_PROVIDERS.map((p) => p.id);
@@ -354,14 +363,17 @@ interface DiscoverArgs {
   from: string;
   to: string;
   page: number;
-  /** Optional TMDB provider id to scope to a single streamer. */
+  /** Optional TMDB provider id for an availability-based (watch_providers) pass. */
   providerId?: number;
+  /** Optional TMDB TV network id for a production-based (with_networks) pass.
+   *  Only meaningful when mediaType === "tv". */
+  networkId?: number;
   /** Override the default TV sort (popularity.desc) for a second pass. */
   tvSort?: "popularity.desc" | "first_air_date.desc";
 }
 
 async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
-  const { mediaType, region, from, to, page, providerId, tvSort } = args;
+  const { mediaType, region, from, to, page, providerId, networkId, tvSort } = args;
   const isMovie = mediaType === "movie";
   // Movies: filter and sort by primary_release_date (simple case).
   // TV: filter by `air_date` so we catch new SEASONS and EPISODES of existing
@@ -373,12 +385,19 @@ async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
     include_video: "false",
     language: "en-US",
     sort_by: isMovie ? "primary_release_date.asc" : tvSort ?? "popularity.desc",
-    watch_region: region,
-    with_watch_monetization_types: "flatrate|free|ads",
     page,
   };
   if (providerId != null) {
+    // Availability-based pass: requires watch_region. Filters to what TMDB
+    // has flagged as currently available on the given service in the region.
+    params.watch_region = region;
     params.with_watch_providers = providerId;
+    params.with_watch_monetization_types = "flatrate|free|ads";
+  } else if (networkId != null) {
+    // Production-based pass: no watch_region. Filters by the TV network that
+    // owns the show, so Netflix originals surface even when their per-region
+    // watch_providers data hasn't been populated yet.
+    params.with_networks = networkId;
   }
   if (isMovie) {
     params["primary_release_date.gte"] = from;
@@ -452,20 +471,34 @@ export async function fetchUpcomingReleases(
   const to = toYmd(endDate);
 
   // --- Phase 1: discovery ---------------------------------------------------
-  // Only the providers in ALLOWED_PROVIDERS are scanned, so we drop the
-  // generic region-wide pass entirely and spend the saved API budget on
-  // deeper per-provider pagination. For each allowed provider we run:
-  //   * MOVIE_PAGES pages of /discover/movie (sort: primary_release_date.asc)
-  //   * TV_POP_PAGES pages of /discover/tv   (sort: popularity.desc)
-  //   * TV_NEW_PAGES pages of /discover/tv   (sort: first_air_date.desc) so
-  //     brand new series that popularity sort misses still surface.
+  // Two parallel passes per provider:
+  //
+  //   A) AVAILABILITY-BASED (watch_region + with_watch_providers): finds
+  //      titles TMDB has flagged as available on the service in the region.
+  //      This lags for upcoming content -- TMDB contributors often add the
+  //      regional provider tag on/near release day -- so it alone misses
+  //      many "coming soon" titles.
+  //
+  //   B) PRODUCTION-BASED (with_networks, TV only): finds TV shows whose
+  //      network matches a hardcoded list per provider (Netflix = 213,
+  //      Apple TV+ = 2552, etc). This catches originals long before the
+  //      per-region watch_providers flag lands.
+  //
+  // Each task carries an `attributedProviderId` used by the discoveredFrom
+  // fallback when TMDB's detail watch/providers response is empty.
   const MOVIE_PAGES = 5;
   const TV_POP_PAGES = 4;
   const TV_NEW_PAGES = 3;
-  type DiscoverTask = DiscoverArgs & { mediaType: MediaType; providerId: number };
+  const NETWORK_POP_PAGES = 3;
+  const NETWORK_NEW_PAGES = 3;
+  type DiscoverTask = DiscoverArgs & {
+    mediaType: MediaType;
+    attributedProviderId: number;
+  };
   const discoverTasks: DiscoverTask[] = [];
 
-  for (const providerId of ALLOWED_PROVIDER_IDS) {
+  for (const provider of ALLOWED_PROVIDERS) {
+    // --- A) Availability-based ---
     if (includeMovies) {
       for (let p = 1; p <= MOVIE_PAGES; p++) {
         discoverTasks.push({
@@ -474,7 +507,8 @@ export async function fetchUpcomingReleases(
           from,
           to,
           page: p,
-          providerId,
+          providerId: provider.id,
+          attributedProviderId: provider.id,
         });
       }
     }
@@ -486,7 +520,8 @@ export async function fetchUpcomingReleases(
           from,
           to,
           page: p,
-          providerId,
+          providerId: provider.id,
+          attributedProviderId: provider.id,
         });
       }
       for (let p = 1; p <= TV_NEW_PAGES; p++) {
@@ -496,9 +531,39 @@ export async function fetchUpcomingReleases(
           from,
           to,
           page: p,
-          providerId,
+          providerId: provider.id,
           tvSort: "first_air_date.desc",
+          attributedProviderId: provider.id,
         });
+      }
+
+      // --- B) Production-based (TV networks) ---
+      if (provider.tvNetworkIds) {
+        for (const networkId of provider.tvNetworkIds) {
+          for (let p = 1; p <= NETWORK_POP_PAGES; p++) {
+            discoverTasks.push({
+              mediaType: "tv",
+              region,
+              from,
+              to,
+              page: p,
+              networkId,
+              attributedProviderId: provider.id,
+            });
+          }
+          for (let p = 1; p <= NETWORK_NEW_PAGES; p++) {
+            discoverTasks.push({
+              mediaType: "tv",
+              region,
+              from,
+              to,
+              page: p,
+              networkId,
+              tvSort: "first_air_date.desc",
+              attributedProviderId: provider.id,
+            });
+          }
+        }
       }
     }
   }
@@ -524,12 +589,12 @@ export async function fetchUpcomingReleases(
       const key = `${task.mediaType}-${item.id}`;
       const existing = candidatesByKey.get(key);
       if (existing) {
-        existing.discoveredFrom.add(task.providerId);
+        existing.discoveredFrom.add(task.attributedProviderId);
       } else {
         candidatesByKey.set(key, {
           mediaType: task.mediaType,
           item,
-          discoveredFrom: new Set([task.providerId]),
+          discoveredFrom: new Set([task.attributedProviderId]),
         });
       }
     }
