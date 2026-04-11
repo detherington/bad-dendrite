@@ -1010,6 +1010,9 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     responseShape: null,
     firstResponseKeys: null,
     firstResponseSample: null,
+    firstShowSample: null,
+    itemsWithReleaseDate: 0,
+    itemsWithoutReleaseDate: 0,
   };
   const [discoverResults, tvmazeEpisodes, saResult] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),

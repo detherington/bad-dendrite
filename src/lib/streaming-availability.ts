@@ -138,18 +138,42 @@ function unixToYmd(ts: number | null | undefined): string | null {
   }
 }
 
+/** Pick the earliest per-show streaming availability date for the
+ *  target country from a full SaShow object. This is the authoritative
+ *  "coming on date X" signal — `show.streamingOptions[country][].availableSince`
+ *  is the scheduled-to-become-available timestamp. For an
+ *  `target_type=upcoming` query that date is in the FUTURE.
+ *
+ *  Note: `change.timestamp` on the `changes` array entries is NOT the
+ *  release date — it's the timestamp when SA recorded the change in
+ *  its own database (i.e. when the "this is coming" announcement was
+ *  indexed), and is typically in the past. Do not use it. */
+function pickReleaseDateFromShow(show: SaShow, countryLc: string): string | null {
+  const options = show.streamingOptions?.[countryLc];
+  if (!options || options.length === 0) return null;
+  const future = options
+    .map((o) => o.availableSince)
+    .filter((ts): ts is number => typeof ts === "number" && ts > 0)
+    .sort((a, b) => a - b);
+  return unixToYmd(future[0] ?? null);
+}
+
 /** Extract `{ show, releaseDate }` entries from a /changes response.
  *
- *  v4 primary shape: each `changes[i]` has a `showId` and a `timestamp`,
- *  and `shows` is a map keyed by those showIds. We iterate the changes
- *  array (which is the authoritative list of "these titles are changing"),
- *  look up the full show from the map, and use the change's timestamp
- *  as the release-date hint — it's the "coming to X on date Y" signal
- *  SA publishes for upcoming catalog additions.
+ *  v4 primary shape: each `changes[i]` has a `showId`, and `shows` is a
+ *  map keyed by those showIds. We iterate the changes array (which is
+ *  the authoritative list of "these titles are changing"), look up the
+ *  full show from the map, and pull the release date from
+ *  `show.streamingOptions[country].availableSince` — NOT from
+ *  `change.timestamp`, which is when SA recorded the change, not when
+ *  the title becomes available.
  *
  *  Falls back gracefully to shows-as-array and shows-inlined-on-change
  *  shapes for older or future API revisions. */
-function extractChangeEntries(res: ChangesResponse): SaExtractedEntry[] {
+function extractChangeEntries(
+  res: ChangesResponse,
+  countryLc: string,
+): SaExtractedEntry[] {
   const showsMap =
     res.shows && typeof res.shows === "object" && !Array.isArray(res.shows)
       ? (res.shows as Record<string, SaShow>)
@@ -166,7 +190,7 @@ function extractChangeEntries(res: ChangesResponse): SaExtractedEntry[] {
       if (!show) continue;
       out.push({
         show,
-        releaseDate: unixToYmd(change.timestamp),
+        releaseDate: pickReleaseDateFromShow(show, countryLc),
       });
     }
     return out;
@@ -174,11 +198,17 @@ function extractChangeEntries(res: ChangesResponse): SaExtractedEntry[] {
 
   // Fallback: shows-as-map without a usable changes array.
   if (showsMap) {
-    return Object.values(showsMap).map((show) => ({ show, releaseDate: null }));
+    return Object.values(showsMap).map((show) => ({
+      show,
+      releaseDate: pickReleaseDateFromShow(show, countryLc),
+    }));
   }
   // Fallback: shows-as-array (older API revisions).
   if (Array.isArray(res.shows)) {
-    return (res.shows as SaShow[]).map((show) => ({ show, releaseDate: null }));
+    return (res.shows as SaShow[]).map((show) => ({
+      show,
+      releaseDate: pickReleaseDateFromShow(show, countryLc),
+    }));
   }
   // Fallback: shows inlined on each change as `target` or `show`.
   if (Array.isArray(res.changes)) {
@@ -186,7 +216,10 @@ function extractChangeEntries(res: ChangesResponse): SaExtractedEntry[] {
     for (const change of res.changes) {
       const show = change.target ?? change.show;
       if (show) {
-        out.push({ show, releaseDate: unixToYmd(change.timestamp) });
+        out.push({
+          show,
+          releaseDate: pickReleaseDateFromShow(show, countryLc),
+        });
       }
     }
     return out;
@@ -287,6 +320,14 @@ export interface SaDiagnostics {
   firstResponseKeys: string[] | null;
   /** First raw response, truncated to ~1500 chars, for deep debugging. */
   firstResponseSample: string | null;
+  /** Truncated JSON of the first show in the first successful shows
+   *  map, so we can inspect the exact SaShow shape (streamingOptions,
+   *  tmdbId format, etc.) when results look wrong. */
+  firstShowSample: string | null;
+  /** How many extracted entries actually had a usable release date
+   *  from the streaming options vs. dropped for lack of one. */
+  itemsWithReleaseDate: number;
+  itemsWithoutReleaseDate: number;
 }
 
 export interface SaFetchResult {
@@ -323,6 +364,9 @@ export async function fetchStreamingAvailabilityUpcoming(
     responseShape: null,
     firstResponseKeys: null,
     firstResponseSample: null,
+    firstShowSample: null,
+    itemsWithReleaseDate: 0,
+    itemsWithoutReleaseDate: 0,
   };
 
   if (!diagnostics.configured) {
@@ -384,8 +428,8 @@ export async function fetchStreamingAvailabilityUpcoming(
         return;
       }
 
-      // Capture diagnostics about the first successful response so we can
-      // tell whether our parser matches the current API contract.
+      // Capture diagnostics about the first successful response so we
+      // can tell whether our parser matches the current API contract.
       if (diagnostics.responseShape == null) {
         const shows = res.shows;
         if (shows && typeof shows === "object" && !Array.isArray(shows)) {
@@ -400,15 +444,28 @@ export async function fetchStreamingAvailabilityUpcoming(
         try {
           diagnostics.firstResponseKeys = Object.keys(res as object);
           diagnostics.firstResponseSample = JSON.stringify(res).slice(0, 1500);
+          if (shows && typeof shows === "object") {
+            const firstShow = Array.isArray(shows)
+              ? (shows as SaShow[])[0]
+              : Object.values(shows as Record<string, SaShow>)[0];
+            if (firstShow) {
+              diagnostics.firstShowSample = JSON.stringify(firstShow).slice(0, 1500);
+            }
+          }
         } catch {
           /* ignore — just diagnostic */
         }
       }
 
-      const entries = extractChangeEntries(res);
-      for (const { show, releaseDate: changeDate } of entries) {
+      const entries = extractChangeEntries(res, countryLc);
+      for (const { show, releaseDate } of entries) {
         const parsed = parseTmdbIdString(show.tmdbId);
         if (!parsed) continue;
+        if (releaseDate) {
+          diagnostics.itemsWithReleaseDate++;
+        } else {
+          diagnostics.itemsWithoutReleaseDate++;
+        }
         const key = `${parsed.mediaType}-${parsed.id}`;
         const existing = results.get(key);
         if (existing) {
@@ -417,25 +474,12 @@ export async function fetchStreamingAvailabilityUpcoming(
           // catalogs (a title can be announced for the same day on
           // multiple services).
           if (
-            changeDate &&
-            (!existing.releaseDate || changeDate < existing.releaseDate)
+            releaseDate &&
+            (!existing.releaseDate || releaseDate < existing.releaseDate)
           ) {
-            existing.releaseDate = changeDate;
+            existing.releaseDate = releaseDate;
           }
           continue;
-        }
-
-        // Prefer the change entry's timestamp (the "coming on date X"
-        // signal). Fall back to streamingOptions[country].availableSince
-        // when the timestamp isn't present.
-        let releaseDate: string | null = changeDate;
-        if (!releaseDate) {
-          const options = show.streamingOptions?.[countryLc] ?? [];
-          const earliest = options
-            .map((o) => o.availableSince)
-            .filter((ts): ts is number => typeof ts === "number" && ts > 0)
-            .sort((a, b) => a - b)[0];
-          releaseDate = unixToYmd(earliest);
         }
 
         results.set(key, {
