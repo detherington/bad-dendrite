@@ -18,10 +18,11 @@ const SA_HOST = "streaming-availability.p.rapidapi.com";
  * monthly API usage comfortably under the RapidAPI free tier's 1,000
  * request/month cap.
  *
- * Budget math at 48h: 7 providers × 4 pages × (30 days / 2 days) =
- * ~420 calls/month, leaving ~58% headroom for multi-region cache misses
- * and the occasional early eviction. "Coming soon" data doesn't need to
- * be more than a couple of days fresh, so a 48h window is a safe cap.
+ * Budget math at 48h with current pagination (7 providers × 2
+ * change_types × 3 pages × 15 refreshes/month) ≈ 630 calls/month,
+ * leaving ~37% headroom for multi-region cache misses and occasional
+ * early evictions. "Coming soon" data doesn't need to be more than a
+ * couple of days fresh, so a 48h window is a safe cap.
  */
 const SA_CACHE_SECONDS = 60 * 60 * 48; // 48h
 
@@ -180,15 +181,22 @@ export interface SaFetchResult {
   diagnostics: SaDiagnostics;
 }
 
+/** SA's /changes endpoint doesn't accept comma-separated change_type
+ *  values (returns 400 Bad Request). We want BOTH "new" (brand-new
+ *  catalog additions) and "updated" (additions to existing titles, e.g.
+ *  a new season of an ongoing series), so we iterate over them as
+ *  separate calls. */
+const SA_CHANGE_TYPES = ["new", "updated"] as const;
+
 /** Fetch upcoming additions for each allowed provider. Paginates up to
- *  `pagesPerProvider` pages per provider (25 items/page) and returns a
- *  deduped list keyed by TMDB id plus a diagnostics object describing
- *  exactly what happened. Never throws — failures are captured and
- *  reported via diagnostics. */
+ *  `pagesPerProvider` pages per (provider × change_type) combination
+ *  (25 items/page) and returns a deduped list keyed by TMDB id plus a
+ *  diagnostics object describing exactly what happened. Never throws —
+ *  failures are captured and reported via diagnostics. */
 export async function fetchStreamingAvailabilityUpcoming(
   country: string,
   providerIds: ReadonlyArray<number>,
-  pagesPerProvider: number = 4,
+  pagesPerProvider: number = 3,
 ): Promise<SaFetchResult> {
   const diagnostics: SaDiagnostics = {
     configured: isStreamingAvailabilityConfigured(),
@@ -215,90 +223,89 @@ export async function fetchStreamingAvailabilityUpcoming(
     if (!catalog) continue;
     diagnostics.catalogsQueried.push(catalog);
 
-    let cursor: string | undefined;
-    for (let page = 0; page < pagesPerProvider; page++) {
-      const params: Record<string, string> = {
-        country: countryLc,
-        // "new" covers brand-new additions; "updated" covers additions to
-        // shows that already exist in the catalog (e.g. new seasons).
-        change_type: "new,updated",
-        item_type: "show",
-        // Only titles that aren't available yet. Exactly what we want.
-        target_type: "upcoming",
-        catalogs: catalog,
-        order_by: "release_date",
-        order_direction: "asc",
-        output_language: "en",
-        limit: "25",
-      };
-      if (cursor) params.cursor = cursor;
+    for (const changeType of SA_CHANGE_TYPES) {
+      let cursor: string | undefined;
+      for (let page = 0; page < pagesPerProvider; page++) {
+        const params: Record<string, string> = {
+          country: countryLc,
+          change_type: changeType,
+          item_type: "show",
+          // Only titles that aren't available yet. Exactly what we want.
+          target_type: "upcoming",
+          catalogs: catalog,
+          order_by: "release_date",
+          order_direction: "asc",
+          output_language: "en",
+          limit: "25",
+        };
+        if (cursor) params.cursor = cursor;
 
-      diagnostics.callsAttempted++;
-      let res: ChangesResponse;
-      try {
-        res = await saFetch<ChangesResponse>("/changes", params);
-        diagnostics.callsSucceeded++;
-      } catch (err) {
-        diagnostics.callsFailed++;
-        const message = err instanceof Error ? err.message : String(err);
-        diagnostics.lastError = message.slice(0, 500);
-        // Parse status out of a "SA 401 Unauthorized: ..." message if present.
-        const statusMatch = /^(?:Streaming Availability|SA)\s+(\d{3})/.exec(message);
-        if (statusMatch) {
-          diagnostics.lastErrorStatus = parseInt(statusMatch[1], 10);
-        }
-        // Surface the error in Vercel function logs so users can see it
-        // from the deployment console without curling /api/releases.
-        console.error(`[streaming-availability] ${catalog} page ${page}: ${message}`);
-        // Stop paginating this provider on error, but keep going with
-        // the remaining providers — partial data is still useful.
-        break;
-      }
-
-      // Record which top-level shape SA actually returned so we can tell
-      // whether our parser matches the current API contract.
-      if (diagnostics.responseShape == null) {
-        if (Array.isArray((res as ChangesResponse).shows)) {
-          diagnostics.responseShape = "shows";
-        } else if (Array.isArray((res as ChangesResponse).changes)) {
-          diagnostics.responseShape = "changes";
-        } else {
-          diagnostics.responseShape = "unknown";
-        }
-      }
-
-      const shows = extractShowsFromChanges(res);
-      for (const show of shows) {
-        const parsed = parseTmdbIdString(show.tmdbId);
-        if (!parsed) continue;
-        const key = `${parsed.mediaType}-${parsed.id}`;
-        const existing = results.get(key);
-        if (existing) {
-          existing.providerIds.add(providerId);
-          continue;
+        diagnostics.callsAttempted++;
+        let res: ChangesResponse;
+        try {
+          res = await saFetch<ChangesResponse>("/changes", params);
+          diagnostics.callsSucceeded++;
+        } catch (err) {
+          diagnostics.callsFailed++;
+          const message = err instanceof Error ? err.message : String(err);
+          diagnostics.lastError = message.slice(0, 500);
+          const statusMatch = /^(?:Streaming Availability|SA)\s+(\d{3})/.exec(message);
+          if (statusMatch) {
+            diagnostics.lastErrorStatus = parseInt(statusMatch[1], 10);
+          }
+          console.error(
+            `[streaming-availability] ${catalog}/${changeType} page ${page}: ${message}`,
+          );
+          // Stop paginating this (catalog, change_type) on error, but
+          // keep going with the remaining combinations.
+          break;
         }
 
-        // Derive the soonest release date from streamingOptions[country]
-        // availableSince timestamps, if any.
-        const options = show.streamingOptions?.[countryLc] ?? [];
-        const earliest = options
-          .map((o) => o.availableSince)
-          .filter((ts): ts is number => typeof ts === "number" && ts > 0)
-          .sort((a, b) => a - b)[0];
-        const releaseDate = earliest
-          ? new Date(earliest * 1000).toISOString().slice(0, 10)
-          : null;
+        // Record which top-level shape SA actually returned so we can tell
+        // whether our parser matches the current API contract.
+        if (diagnostics.responseShape == null) {
+          if (Array.isArray((res as ChangesResponse).shows)) {
+            diagnostics.responseShape = "shows";
+          } else if (Array.isArray((res as ChangesResponse).changes)) {
+            diagnostics.responseShape = "changes";
+          } else {
+            diagnostics.responseShape = "unknown";
+          }
+        }
 
-        results.set(key, {
-          mediaType: parsed.mediaType,
-          tmdbId: parsed.id,
-          providerIds: new Set([providerId]),
-          releaseDate,
-        });
+        const shows = extractShowsFromChanges(res);
+        for (const show of shows) {
+          const parsed = parseTmdbIdString(show.tmdbId);
+          if (!parsed) continue;
+          const key = `${parsed.mediaType}-${parsed.id}`;
+          const existing = results.get(key);
+          if (existing) {
+            existing.providerIds.add(providerId);
+            continue;
+          }
+
+          // Derive the soonest release date from streamingOptions[country]
+          // availableSince timestamps, if any.
+          const options = show.streamingOptions?.[countryLc] ?? [];
+          const earliest = options
+            .map((o) => o.availableSince)
+            .filter((ts): ts is number => typeof ts === "number" && ts > 0)
+            .sort((a, b) => a - b)[0];
+          const releaseDate = earliest
+            ? new Date(earliest * 1000).toISOString().slice(0, 10)
+            : null;
+
+          results.set(key, {
+            mediaType: parsed.mediaType,
+            tmdbId: parsed.id,
+            providerIds: new Set([providerId]),
+            releaseDate,
+          });
+        }
+
+        if (!res.hasMore || !res.nextCursor) break;
+        cursor = res.nextCursor;
       }
-
-      if (!res.hasMore || !res.nextCursor) break;
-      cursor = res.nextCursor;
     }
   }
 
