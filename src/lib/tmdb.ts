@@ -356,6 +356,14 @@ function pickMovieReleaseDate(
  *  the set of ALLOWED_PROVIDER ids whose markers appear in the detail.
  *  An empty set means "not an original, drop it."
  *
+ *  Matching is layered: we first check TMDB company/network ids against
+ *  the provider's hardcoded id list, then fall back to case-insensitive
+ *  substring matching on the company/network name. The name fallback
+ *  exists because TMDB's id tagging for streamer production arms is
+ *  inconsistent — e.g. some Netflix movies list "Netflix" under an id
+ *  that doesn't appear in any widely-cited reference, but the string
+ *  "Netflix" is always somewhere in the production_companies names.
+ *
  *  This is the ONLY signal used to decide what counts as a streaming
  *  original — watch_providers is purely informational downstream. */
 function verifyAndAttributeOriginal(
@@ -365,31 +373,60 @@ function verifyAndAttributeOriginal(
   const matched = new Set<number>();
 
   if (mediaType === "movie") {
-    const companyIds = (details.production_companies ?? []).map((c) => c.id);
-    if (companyIds.length === 0) return matched;
-    // Fast path: does the movie touch any allowed-original company at all?
-    if (!companyIds.some((id) => ALL_ORIGINAL_MOVIE_COMPANY_IDS.has(id))) {
-      return matched;
-    }
+    const companies = details.production_companies ?? [];
+    if (companies.length === 0) return matched;
+    const companyIds = companies.map((c) => c.id);
+    const companyNames = companies.map((c) => (c.name || "").toLowerCase());
+
     for (const provider of ALLOWED_PROVIDERS) {
-      if (!provider.movieCompanyIds) continue;
-      if (provider.movieCompanyIds.some((id) => companyIds.includes(id))) {
-        matched.add(provider.id);
+      let hit = false;
+      if (provider.movieCompanyIds) {
+        for (const id of provider.movieCompanyIds) {
+          if (companyIds.includes(id)) {
+            hit = true;
+            break;
+          }
+        }
       }
+      if (!hit && provider.movieCompanyNamePatterns) {
+        for (const pat of provider.movieCompanyNamePatterns) {
+          const needle = pat.toLowerCase();
+          if (companyNames.some((n) => n.includes(needle))) {
+            hit = true;
+            break;
+          }
+        }
+      }
+      if (hit) matched.add(provider.id);
     }
     return matched;
   }
 
-  const networkIds = (details.networks ?? []).map((n) => n.id);
-  if (networkIds.length === 0) return matched;
-  if (!networkIds.some((id) => ALL_ORIGINAL_TV_NETWORK_IDS.has(id))) {
-    return matched;
-  }
+  const networks = details.networks ?? [];
+  if (networks.length === 0) return matched;
+  const networkIds = networks.map((n) => n.id);
+  const networkNames = networks.map((n) => (n.name || "").toLowerCase());
+
   for (const provider of ALLOWED_PROVIDERS) {
-    if (!provider.tvNetworkIds) continue;
-    if (provider.tvNetworkIds.some((id) => networkIds.includes(id))) {
-      matched.add(provider.id);
+    let hit = false;
+    if (provider.tvNetworkIds) {
+      for (const id of provider.tvNetworkIds) {
+        if (networkIds.includes(id)) {
+          hit = true;
+          break;
+        }
+      }
     }
+    if (!hit && provider.tvNetworkNamePatterns) {
+      for (const pat of provider.tvNetworkNamePatterns) {
+        const needle = pat.toLowerCase();
+        if (networkNames.some((n) => n.includes(needle))) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (hit) matched.add(provider.id);
   }
   return matched;
 }
@@ -454,6 +491,13 @@ interface AllowedProvider {
   name: string;
   tvNetworkIds?: ReadonlyArray<number>;
   movieCompanyIds?: ReadonlyArray<number>;
+  /** Case-insensitive substring patterns matched against a movie's
+   *  production_companies[].name. Fallback when TMDB id tagging is
+   *  inconsistent (which is common for streamer production arms). */
+  movieCompanyNamePatterns?: ReadonlyArray<string>;
+  /** Case-insensitive substring patterns matched against a TV show's
+   *  networks[].name. Fallback for the same id-tagging reason. */
+  tvNetworkNamePatterns?: ReadonlyArray<string>;
 }
 
 const ALLOWED_PROVIDERS: ReadonlyArray<AllowedProvider> = [
@@ -461,75 +505,74 @@ const ALLOWED_PROVIDERS: ReadonlyArray<AllowedProvider> = [
     id: 8,
     name: "Netflix",
     tvNetworkIds: [213],
-    // 145174 Netflix Productions, 178464 Netflix, 224344 Netflix
-    // International Pictures, 137351 Netflix Animation.
+    tvNetworkNamePatterns: ["netflix"],
     movieCompanyIds: [145174, 178464, 224344, 137351],
+    movieCompanyNamePatterns: ["netflix"],
   },
   {
     id: 350,
     name: "Apple TV+",
     tvNetworkIds: [2552],
-    // 151998 Apple Original Films, 194232 Apple Studios.
+    tvNetworkNamePatterns: ["apple tv"],
     movieCompanyIds: [151998, 194232],
+    movieCompanyNamePatterns: ["apple original", "apple studios", "apple tv"],
   },
   {
     id: 337,
     name: "Disney+",
     tvNetworkIds: [2739],
-    // 2 Walt Disney Pictures, 3 Pixar, 420 Marvel Studios, 1 Lucasfilm,
-    // 6125 Walt Disney Pictures (alt), 10342 Walt Disney Animation
-    // Studios. Disney theatrical content lands on Disney+ post-release,
-    // which the user explicitly wants surfaced as a "Disney+ original".
+    tvNetworkNamePatterns: ["disney+", "disney plus"],
+    // Disney theatrical content that lands on Disney+ counts per the
+    // user's definition since Disney owns the studio.
     movieCompanyIds: [2, 3, 420, 1, 6125, 10342],
+    movieCompanyNamePatterns: [
+      "walt disney",
+      "pixar",
+      "marvel studios",
+      "lucasfilm",
+      "disney+",
+    ],
   },
   {
     id: 9,
     name: "Amazon Prime Video",
     tvNetworkIds: [1024],
-    // 20580 Amazon Studios, 200554 Amazon MGM Studios, 21 MGM
-    // (Amazon-owned), 1632 Amazon Prime Video (rare tagging).
+    tvNetworkNamePatterns: ["prime video", "amazon"],
     movieCompanyIds: [20580, 200554, 21, 1632],
+    movieCompanyNamePatterns: ["amazon studios", "amazon mgm", "prime video"],
   },
   {
     id: 15,
     name: "Hulu",
     tvNetworkIds: [453],
-    // Hulu originals are overwhelmingly TV. Movies under "Hulu Original
-    // Films" are sparse and usually produced by 20th Century Studios
-    // (owned by Disney). 19366 Hulu is the only id with reliable
-    // "Hulu original" semantics; 20th Century is too noisy to include.
+    tvNetworkNamePatterns: ["hulu"],
     movieCompanyIds: [19366],
+    movieCompanyNamePatterns: ["hulu"],
   },
   {
     id: 386,
     name: "Peacock Premium",
     tvNetworkIds: [3353],
-    // Peacock movie originals are almost entirely Universal theatrical
-    // titles arriving after a short theatrical window. 33 Universal
-    // Pictures catches those; 3268 Focus Features (Universal-owned)
-    // adds prestige titles.
+    tvNetworkNamePatterns: ["peacock"],
     movieCompanyIds: [33, 3268],
+    movieCompanyNamePatterns: ["peacock", "universal pictures", "focus features"],
   },
   {
     id: 1899,
     name: "Max",
     tvNetworkIds: [49, 3186],
-    // 174 Warner Bros. Pictures, 12 New Line Cinema (WB-owned),
-    // 9993 DC Entertainment, 429 DC Comics, 2785 HBO (films arm),
-    // 5820 HBO Films. WB theatrical releases that land on Max are
-    // surfaced because WBD owns both.
+    tvNetworkNamePatterns: ["hbo", "max"],
     movieCompanyIds: [174, 12, 9993, 429, 2785, 5820],
+    movieCompanyNamePatterns: [
+      "warner bros",
+      "new line",
+      "hbo films",
+      "hbo max",
+      "dc entertainment",
+      "dc studios",
+    ],
   },
 ];
-
-// Union of all original-producing network / company ids, used for the
-// post-detail originality filter.
-const ALL_ORIGINAL_TV_NETWORK_IDS = new Set<number>(
-  ALLOWED_PROVIDERS.flatMap((p) => p.tvNetworkIds ?? []),
-);
-const ALL_ORIGINAL_MOVIE_COMPANY_IDS = new Set<number>(
-  ALLOWED_PROVIDERS.flatMap((p) => p.movieCompanyIds ?? []),
-);
 
 const ALLOWED_PROVIDER_IDS: ReadonlyArray<number> = ALLOWED_PROVIDERS.map((p) => p.id);
 const ALLOWED_PROVIDER_ID_SET = new Set<number>(ALLOWED_PROVIDER_IDS);
