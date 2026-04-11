@@ -25,6 +25,7 @@ import {
   extractJsonLdEntities,
   mediaTypeFromJsonLdType,
 } from "./json-ld";
+import { walkForTitleDatePairs } from "./json-walk";
 import type { ScrapedRelease, ScraperDiagnostic, ScraperResult } from "./types";
 
 const SOURCE = "netflix-tudum";
@@ -127,115 +128,6 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
   }));
 
   return { releases: deduped, diagnostics: [diagnostic] };
-}
-
-// ---------- JSON tree walking ----------
-
-interface WalkedItem {
-  title: string;
-  releaseDate: string;
-  year?: number;
-  mediaType: "movie" | "tv" | "unknown";
-}
-
-const TITLE_KEYS = new Set([
-  "title",
-  "name",
-  "headline",
-  "displayTitle",
-  "displayName",
-]);
-
-const DATE_KEYS = new Set([
-  "releaseDate",
-  "availableDate",
-  "availableFrom",
-  "premiereDate",
-  "premiere_date",
-  "launchDate",
-  "launch_date",
-  "airDate",
-  "air_date",
-  "date",
-  "publishedDate",
-  "published_at",
-  "datePublished",
-]);
-
-function pickStringField(obj: Record<string, unknown>, keys: Set<string>): string | null {
-  for (const k of Object.keys(obj)) {
-    if (!keys.has(k)) continue;
-    const v = obj[k];
-    if (typeof v === "string" && v.trim().length > 0) return v.trim();
-  }
-  return null;
-}
-
-function normaliseDateStringLocal(raw: string): string | null {
-  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const parsed = new Date(raw);
-  if (!Number.isNaN(parsed.getTime())) {
-    return parsed.toISOString().slice(0, 10);
-  }
-  return null;
-}
-
-function looksLikeTitle(candidate: string): boolean {
-  const trimmed = candidate.trim();
-  if (trimmed.length < 2 || trimmed.length > 200) return false;
-  // Reject things that look like URLs, slugs, or sentences.
-  if (/^https?:\/\//.test(trimmed)) return false;
-  if (/\/[a-z0-9-]+\//.test(trimmed) && !/\s/.test(trimmed)) return false;
-  return true;
-}
-
-function walkForTitleDatePairs(root: unknown): WalkedItem[] {
-  const out: WalkedItem[] = [];
-  const seen = new Set<unknown>();
-
-  function visit(node: unknown): void {
-    if (!node) return;
-    if (typeof node !== "object") return;
-    if (seen.has(node)) return;
-    seen.add(node);
-
-    if (Array.isArray(node)) {
-      for (const child of node) visit(child);
-      return;
-    }
-
-    const obj = node as Record<string, unknown>;
-    const titleRaw = pickStringField(obj, TITLE_KEYS);
-    const dateRaw = pickStringField(obj, DATE_KEYS);
-    if (titleRaw && dateRaw && looksLikeTitle(titleRaw)) {
-      const normalised = normaliseDateStringLocal(dateRaw);
-      if (normalised) {
-        // Infer media type from any `type`, `contentType`, or
-        // `category` field on the same object.
-        const typeField =
-          pickStringField(obj, new Set(["type", "contentType", "category", "__typename"]))
-            ?.toLowerCase() ?? "";
-        const mediaType: "movie" | "tv" | "unknown" =
-          /series|season|episode|show/.test(typeField)
-            ? "tv"
-            : /movie|film|feature/.test(typeField)
-              ? "movie"
-              : "unknown";
-        out.push({
-          title: titleRaw,
-          releaseDate: normalised,
-          mediaType,
-          year: parseInt(normalised.slice(0, 4), 10) || undefined,
-        });
-      }
-    }
-
-    for (const key of Object.keys(obj)) visit(obj[key]);
-  }
-
-  visit(root);
-  return out;
 }
 
 // ---------- Dedupe ----------
