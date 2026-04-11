@@ -155,16 +155,56 @@ export interface SaUpcoming {
   releaseDate: string | null;
 }
 
+/** Diagnostics captured during a /changes sweep. Exposed via the
+ *  /api/releases debug response so the user can see at a glance whether
+ *  SA is configured, whether calls are succeeding, and what went wrong
+ *  when they aren't. */
+export interface SaDiagnostics {
+  configured: boolean;
+  catalogsQueried: string[];
+  callsAttempted: number;
+  callsSucceeded: number;
+  callsFailed: number;
+  itemsReturned: number;
+  /** Most recent failure message (if any), truncated to 500 chars. */
+  lastError: string | null;
+  /** HTTP status of the most recent failed call (if captured). */
+  lastErrorStatus: number | null;
+  /** First successful call's shape-detection breadcrumb so we can tell
+   *  whether SA's response shape matches what we expected. */
+  responseShape: "shows" | "changes" | "unknown" | null;
+}
+
+export interface SaFetchResult {
+  items: SaUpcoming[];
+  diagnostics: SaDiagnostics;
+}
+
 /** Fetch upcoming additions for each allowed provider. Paginates up to
  *  `pagesPerProvider` pages per provider (25 items/page) and returns a
- *  deduped list keyed by TMDB id. Returns [] when the API key is not
- *  configured so the rest of the pipeline stays unaffected. */
+ *  deduped list keyed by TMDB id plus a diagnostics object describing
+ *  exactly what happened. Never throws — failures are captured and
+ *  reported via diagnostics. */
 export async function fetchStreamingAvailabilityUpcoming(
   country: string,
   providerIds: ReadonlyArray<number>,
   pagesPerProvider: number = 4,
-): Promise<SaUpcoming[]> {
-  if (!isStreamingAvailabilityConfigured()) return [];
+): Promise<SaFetchResult> {
+  const diagnostics: SaDiagnostics = {
+    configured: isStreamingAvailabilityConfigured(),
+    catalogsQueried: [],
+    callsAttempted: 0,
+    callsSucceeded: 0,
+    callsFailed: 0,
+    itemsReturned: 0,
+    lastError: null,
+    lastErrorStatus: null,
+    responseShape: null,
+  };
+
+  if (!diagnostics.configured) {
+    return { items: [], diagnostics };
+  }
 
   // SA expects lowercase country codes.
   const countryLc = country.toLowerCase();
@@ -173,6 +213,7 @@ export async function fetchStreamingAvailabilityUpcoming(
   for (const providerId of providerIds) {
     const catalog = TMDB_PROVIDER_TO_SA_CATALOG[providerId];
     if (!catalog) continue;
+    diagnostics.catalogsQueried.push(catalog);
 
     let cursor: string | undefined;
     for (let page = 0; page < pagesPerProvider; page++) {
@@ -192,13 +233,38 @@ export async function fetchStreamingAvailabilityUpcoming(
       };
       if (cursor) params.cursor = cursor;
 
+      diagnostics.callsAttempted++;
       let res: ChangesResponse;
       try {
         res = await saFetch<ChangesResponse>("/changes", params);
-      } catch {
+        diagnostics.callsSucceeded++;
+      } catch (err) {
+        diagnostics.callsFailed++;
+        const message = err instanceof Error ? err.message : String(err);
+        diagnostics.lastError = message.slice(0, 500);
+        // Parse status out of a "SA 401 Unauthorized: ..." message if present.
+        const statusMatch = /^(?:Streaming Availability|SA)\s+(\d{3})/.exec(message);
+        if (statusMatch) {
+          diagnostics.lastErrorStatus = parseInt(statusMatch[1], 10);
+        }
+        // Surface the error in Vercel function logs so users can see it
+        // from the deployment console without curling /api/releases.
+        console.error(`[streaming-availability] ${catalog} page ${page}: ${message}`);
         // Stop paginating this provider on error, but keep going with
         // the remaining providers — partial data is still useful.
         break;
+      }
+
+      // Record which top-level shape SA actually returned so we can tell
+      // whether our parser matches the current API contract.
+      if (diagnostics.responseShape == null) {
+        if (Array.isArray((res as ChangesResponse).shows)) {
+          diagnostics.responseShape = "shows";
+        } else if (Array.isArray((res as ChangesResponse).changes)) {
+          diagnostics.responseShape = "changes";
+        } else {
+          diagnostics.responseShape = "unknown";
+        }
       }
 
       const shows = extractShowsFromChanges(res);
@@ -236,5 +302,6 @@ export async function fetchStreamingAvailabilityUpcoming(
     }
   }
 
-  return Array.from(results.values());
+  diagnostics.itemsReturned = results.size;
+  return { items: Array.from(results.values()), diagnostics };
 }

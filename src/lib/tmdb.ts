@@ -15,7 +15,8 @@ import {
 import {
   fetchStreamingAvailabilityUpcoming,
   isStreamingAvailabilityConfigured,
-  type SaUpcoming,
+  type SaDiagnostics,
+  type SaFetchResult,
 } from "./streaming-availability";
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
@@ -792,9 +793,49 @@ function dedupeById(releases: Release[]): Release[] {
   return out;
 }
 
+/** Top-level diagnostic surface exposed on /api/releases for debugging
+ *  source coverage and configuration issues (especially Streaming
+ *  Availability API wiring, which is silent by design). */
+export interface ReleaseSourceDiagnostics {
+  region: string;
+  daysAhead: number;
+  tmdb: {
+    discoverTasks: number;
+    discoverFulfilled: number;
+    discoverRejected: number;
+    uniqueCandidates: number;
+    detailFulfilled: number;
+    detailRejected: number;
+  };
+  tvmaze: {
+    episodes: number;
+  };
+  streamingAvailability: SaDiagnostics;
+  releasesAfterOriginalityFilter: number;
+  releasesAfterDateClamp: number;
+}
+
+export interface FetchUpcomingReleasesResult {
+  releases: Release[];
+  diagnostics: ReleaseSourceDiagnostics;
+}
+
+/** Backward-compatible wrapper — returns just the releases. Used by the
+ *  server component page.tsx so the UI doesn't have to know about
+ *  diagnostics. */
 export async function fetchUpcomingReleases(
   opts: FetchReleasesOptions = {},
 ): Promise<Release[]> {
+  const { releases } = await fetchUpcomingReleasesWithDiagnostics(opts);
+  return releases;
+}
+
+/** Full-fat entry point that returns both releases and diagnostics.
+ *  /api/releases uses this to expose the diagnostics in the JSON body
+ *  so the user can debug SA/TVmaze/TMDB wiring by curling the route. */
+export async function fetchUpcomingReleasesWithDiagnostics(
+  opts: FetchReleasesOptions = {},
+): Promise<FetchUpcomingReleasesResult> {
   const region = (opts.region || getRegion()).toUpperCase();
   const daysAhead = opts.daysAhead ?? 90;
   const maxItems = opts.maxItems ?? 500;
@@ -947,17 +988,46 @@ export async function fetchUpcomingReleases(
   // Run TMDB discovery, TVmaze /schedule/web, and Streaming Availability
   // /changes in parallel. None of them depend on each other's output at
   // this phase, so cold-fetch latency is max(A, B, C) rather than A+B+C.
-  const [discoverResults, tvmazeEpisodes, saResults] = await Promise.all([
+  //
+  // SA returns a { items, diagnostics } object. We still wrap the call in
+  // a .catch in case an unexpected error escapes the client (it shouldn't
+  // — the client captures errors into diagnostics.lastError — but defense
+  // in depth).
+  const emptySaResult: SaFetchResult = {
+    items: [],
+    diagnostics: {
+      configured: isStreamingAvailabilityConfigured(),
+      catalogsQueried: [],
+      callsAttempted: 0,
+      callsSucceeded: 0,
+      callsFailed: 0,
+      itemsReturned: 0,
+      lastError: null,
+      lastErrorStatus: null,
+      responseShape: null,
+    },
+  };
+  const [discoverResults, tvmazeEpisodes, saResult] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),
     includeTv
       ? fetchTvmazeWebSchedule(from, to, region).catch(() => [] as TvmazeEpisode[])
       : Promise.resolve([] as TvmazeEpisode[]),
-    isStreamingAvailabilityConfigured()
-      ? fetchStreamingAvailabilityUpcoming(region, ALLOWED_PROVIDER_IDS).catch(
-          () => [] as SaUpcoming[],
-        )
-      : Promise.resolve([] as SaUpcoming[]),
+    fetchStreamingAvailabilityUpcoming(region, ALLOWED_PROVIDER_IDS).catch(
+      (err): SaFetchResult => ({
+        items: [],
+        diagnostics: {
+          ...emptySaResult.diagnostics,
+          callsAttempted: 1,
+          callsFailed: 1,
+          lastError: err instanceof Error ? err.message.slice(0, 500) : String(err),
+          lastErrorStatus: null,
+          responseShape: null,
+        },
+      }),
+    ),
   ]);
+  const saResults = saResult.items;
+  const saDiagnostics = saResult.diagnostics;
 
   // Track which allowed providers each candidate was discovered under. If
   // TMDB's watch/providers detail response later comes back empty for the
@@ -1273,7 +1343,30 @@ export async function fetchUpcomingReleases(
     });
   }
 
-  return dedupeById(releases).sort((a, b) => a.releaseDate.localeCompare(b.releaseDate));
+  const deduped = dedupeById(releases).sort((a, b) =>
+    a.releaseDate.localeCompare(b.releaseDate),
+  );
+
+  const diagnostics: ReleaseSourceDiagnostics = {
+    region,
+    daysAhead,
+    tmdb: {
+      discoverTasks: discoverTasks.length,
+      discoverFulfilled: discoverResults.filter((r) => r.status === "fulfilled").length,
+      discoverRejected: discoverResults.filter((r) => r.status === "rejected").length,
+      uniqueCandidates: uniqueCandidates.length,
+      detailFulfilled: detailResults.filter((r) => r.status === "fulfilled").length,
+      detailRejected: detailResults.filter((r) => r.status === "rejected").length,
+    },
+    tvmaze: {
+      episodes: tvmazeEpisodes.length,
+    },
+    streamingAvailability: saDiagnostics,
+    releasesAfterOriginalityFilter: releases.length,
+    releasesAfterDateClamp: deduped.length,
+  };
+
+  return { releases: deduped, diagnostics };
 }
 
 export function tmdbImage(path: string | null, size: "w92" | "w154" | "w185" | "w342" | "w500" | "original" = "w342"): string | null {
