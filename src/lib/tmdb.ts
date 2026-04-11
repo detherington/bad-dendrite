@@ -159,6 +159,20 @@ interface TmdbReleaseDatesRegion {
   release_dates: TmdbRegionalReleaseDate[];
 }
 
+interface TmdbProductionCompanyRef {
+  id: number;
+  name: string;
+  logo_path?: string | null;
+  origin_country?: string;
+}
+
+interface TmdbNetworkRef {
+  id: number;
+  name: string;
+  logo_path?: string | null;
+  origin_country?: string;
+}
+
 interface TmdbDetails {
   id: number;
   title?: string;
@@ -171,6 +185,10 @@ interface TmdbDetails {
   vote_average: number;
   popularity: number;
   genres: TmdbGenre[];
+  /** Present on movie detail responses. */
+  production_companies?: TmdbProductionCompanyRef[];
+  /** Present on TV detail responses. */
+  networks?: TmdbNetworkRef[];
   next_episode_to_air?: TmdbEpisodeInfo | null;
   last_episode_to_air?: TmdbEpisodeInfo | null;
   videos?: { results: TmdbVideo[] };
@@ -333,6 +351,49 @@ function pickMovieReleaseDate(
   return null;
 }
 
+/** Check whether a TMDB detail response matches at least one allowed
+ *  provider's production_companies (movies) or networks (TV). Returns
+ *  the set of ALLOWED_PROVIDER ids whose markers appear in the detail.
+ *  An empty set means "not an original, drop it."
+ *
+ *  This is the ONLY signal used to decide what counts as a streaming
+ *  original — watch_providers is purely informational downstream. */
+function verifyAndAttributeOriginal(
+  details: TmdbDetails,
+  mediaType: MediaType,
+): Set<number> {
+  const matched = new Set<number>();
+
+  if (mediaType === "movie") {
+    const companyIds = (details.production_companies ?? []).map((c) => c.id);
+    if (companyIds.length === 0) return matched;
+    // Fast path: does the movie touch any allowed-original company at all?
+    if (!companyIds.some((id) => ALL_ORIGINAL_MOVIE_COMPANY_IDS.has(id))) {
+      return matched;
+    }
+    for (const provider of ALLOWED_PROVIDERS) {
+      if (!provider.movieCompanyIds) continue;
+      if (provider.movieCompanyIds.some((id) => companyIds.includes(id))) {
+        matched.add(provider.id);
+      }
+    }
+    return matched;
+  }
+
+  const networkIds = (details.networks ?? []).map((n) => n.id);
+  if (networkIds.length === 0) return matched;
+  if (!networkIds.some((id) => ALL_ORIGINAL_TV_NETWORK_IDS.has(id))) {
+    return matched;
+  }
+  for (const provider of ALLOWED_PROVIDERS) {
+    if (!provider.tvNetworkIds) continue;
+    if (provider.tvNetworkIds.some((id) => networkIds.includes(id))) {
+      matched.add(provider.id);
+    }
+  }
+  return matched;
+}
+
 function pickProviders(
   region: string,
   providers: TmdbDetails["watch/providers"] | undefined,
@@ -368,34 +429,107 @@ export interface FetchReleasesOptions {
 }
 
 /**
- * The only streaming services this app considers. Discovery, display, and
- * filtering are all scoped to this set. Adding/removing an entry changes
- * what users see AND how deep the catalog scan goes (fewer providers ==
- * more pages per provider within the same API budget).
+ * The only streaming services this app considers. The app's purpose is to
+ * surface ORIGINAL streaming productions, so each provider declares the
+ * TMDB identifiers that mark content as coming from that service:
  *
- * Each provider can also declare `tvNetworkIds`, which are TMDB TV network
- * IDs that correspond to the service's originals. We use those for a second
- * discovery pass (`with_networks=<id>`) to catch upcoming shows that aren't
- * yet flagged with regional watch_providers data -- TMDB's per-region
- * availability tagging lags for unreleased titles, but the network tag is
- * set at the show record itself and is populated as soon as the show is
- * entered in TMDB.
+ *   - `tvNetworkIds`:     TV networks on TMDB whose shows are this
+ *                         service's originals (use with `with_networks`).
+ *   - `movieCompanyIds`:  production companies on TMDB whose movies count
+ *                         as this service's originals (use with
+ *                         `with_companies`).
+ *
+ * Both lists feed discovery (via `with_networks` / `with_companies`) AND
+ * the post-detail originality filter: a candidate only survives if one of
+ * these ids appears in its `networks` / `production_companies` detail
+ * response. Licensed content that happens to be available on a service
+ * is dropped.
+ *
+ * IDs are best-effort from publicly-cited TMDB records. If a specific
+ * title you expect to see is missing, check its production_companies on
+ * themoviedb.org and add the relevant id here.
  */
 interface AllowedProvider {
   id: number;
   name: string;
   tvNetworkIds?: ReadonlyArray<number>;
+  movieCompanyIds?: ReadonlyArray<number>;
 }
 
 const ALLOWED_PROVIDERS: ReadonlyArray<AllowedProvider> = [
-  { id: 8, name: "Netflix", tvNetworkIds: [213] },
-  { id: 350, name: "Apple TV+", tvNetworkIds: [2552] },
-  { id: 337, name: "Disney+", tvNetworkIds: [2739] },
-  { id: 9, name: "Amazon Prime Video", tvNetworkIds: [1024] },
-  { id: 15, name: "Hulu", tvNetworkIds: [453] },
-  { id: 386, name: "Peacock Premium", tvNetworkIds: [3353] },
-  { id: 1899, name: "Max", tvNetworkIds: [49, 3186] },
+  {
+    id: 8,
+    name: "Netflix",
+    tvNetworkIds: [213],
+    // 145174 Netflix Productions, 178464 Netflix, 224344 Netflix
+    // International Pictures, 137351 Netflix Animation.
+    movieCompanyIds: [145174, 178464, 224344, 137351],
+  },
+  {
+    id: 350,
+    name: "Apple TV+",
+    tvNetworkIds: [2552],
+    // 151998 Apple Original Films, 194232 Apple Studios.
+    movieCompanyIds: [151998, 194232],
+  },
+  {
+    id: 337,
+    name: "Disney+",
+    tvNetworkIds: [2739],
+    // 2 Walt Disney Pictures, 3 Pixar, 420 Marvel Studios, 1 Lucasfilm,
+    // 6125 Walt Disney Pictures (alt), 10342 Walt Disney Animation
+    // Studios. Disney theatrical content lands on Disney+ post-release,
+    // which the user explicitly wants surfaced as a "Disney+ original".
+    movieCompanyIds: [2, 3, 420, 1, 6125, 10342],
+  },
+  {
+    id: 9,
+    name: "Amazon Prime Video",
+    tvNetworkIds: [1024],
+    // 20580 Amazon Studios, 200554 Amazon MGM Studios, 21 MGM
+    // (Amazon-owned), 1632 Amazon Prime Video (rare tagging).
+    movieCompanyIds: [20580, 200554, 21, 1632],
+  },
+  {
+    id: 15,
+    name: "Hulu",
+    tvNetworkIds: [453],
+    // Hulu originals are overwhelmingly TV. Movies under "Hulu Original
+    // Films" are sparse and usually produced by 20th Century Studios
+    // (owned by Disney). 19366 Hulu is the only id with reliable
+    // "Hulu original" semantics; 20th Century is too noisy to include.
+    movieCompanyIds: [19366],
+  },
+  {
+    id: 386,
+    name: "Peacock Premium",
+    tvNetworkIds: [3353],
+    // Peacock movie originals are almost entirely Universal theatrical
+    // titles arriving after a short theatrical window. 33 Universal
+    // Pictures catches those; 3268 Focus Features (Universal-owned)
+    // adds prestige titles.
+    movieCompanyIds: [33, 3268],
+  },
+  {
+    id: 1899,
+    name: "Max",
+    tvNetworkIds: [49, 3186],
+    // 174 Warner Bros. Pictures, 12 New Line Cinema (WB-owned),
+    // 9993 DC Entertainment, 429 DC Comics, 2785 HBO (films arm),
+    // 5820 HBO Films. WB theatrical releases that land on Max are
+    // surfaced because WBD owns both.
+    movieCompanyIds: [174, 12, 9993, 429, 2785, 5820],
+  },
 ];
+
+// Union of all original-producing network / company ids, used for the
+// post-detail originality filter.
+const ALL_ORIGINAL_TV_NETWORK_IDS = new Set<number>(
+  ALLOWED_PROVIDERS.flatMap((p) => p.tvNetworkIds ?? []),
+);
+const ALL_ORIGINAL_MOVIE_COMPANY_IDS = new Set<number>(
+  ALLOWED_PROVIDERS.flatMap((p) => p.movieCompanyIds ?? []),
+);
 
 const ALLOWED_PROVIDER_IDS: ReadonlyArray<number> = ALLOWED_PROVIDERS.map((p) => p.id);
 const ALLOWED_PROVIDER_ID_SET = new Set<number>(ALLOWED_PROVIDER_IDS);
@@ -440,6 +574,9 @@ interface DiscoverArgs {
   /** Optional TMDB TV network id for a production-based (with_networks) pass.
    *  Only meaningful when mediaType === "tv". */
   networkId?: number;
+  /** Optional TMDB production company id for a production-based
+   *  (with_companies) pass. Only meaningful when mediaType === "movie". */
+  companyId?: number;
   /** Optional release-type filter (pipe-separated), e.g. "4|6" for
    *  Digital OR TV release. Movies only. */
   releaseType?: string;
@@ -448,7 +585,7 @@ interface DiscoverArgs {
 }
 
 async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
-  const { mediaType, region, from, to, page, providerId, networkId, releaseType, tvSort } = args;
+  const { mediaType, region, from, to, page, providerId, networkId, companyId, releaseType, tvSort } = args;
   const isMovie = mediaType === "movie";
   // MOVIES: always filter and sort by REGIONAL `release_date.*` instead of
   // `primary_release_date.*`. Primary is the earliest worldwide theatrical
@@ -483,16 +620,23 @@ async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
       params.region = region;
     }
   } else if (networkId != null) {
-    // Production-based pass (TV): no region needed. Filters by the TV
-    // network that owns the show, so Netflix originals surface even when
-    // their per-region watch_providers data hasn't been populated yet.
+    // Production-based pass (TV): filters by the TV network that owns the
+    // show, so Netflix originals surface even when their per-region
+    // watch_providers data hasn't been populated yet.
     params.with_networks = networkId;
+  } else if (companyId != null && isMovie) {
+    // Production-based pass (movies): filters by the production company
+    // that made the movie. This is the primary signal for "streaming
+    // original" — a movie is a Netflix original iff Netflix Productions
+    // (or similar) is in its production_companies list.
+    params.with_companies = companyId;
+    // Keep regional release windows so the digital release date (not the
+    // theatrical one) controls what falls in the window.
+    params.region = region;
   } else if (releaseType != null && isMovie) {
     // Release-type pass (movies only): finds movies with a Digital (4) or
     // TV (6) release type in the region, regardless of whether TMDB has
-    // populated per-region watch_providers yet. Catches upcoming streaming
-    // movies that are entered in TMDB with release dates but not yet
-    // flagged on a specific provider.
+    // populated per-region watch_providers yet.
     params.region = region;
     params.with_release_type = releaseType as string;
   }
@@ -640,6 +784,7 @@ export async function fetchUpcomingReleases(
   const TV_NEW_PAGES = 3;
   const NETWORK_POP_PAGES = 3;
   const NETWORK_NEW_PAGES = 3;
+  const COMPANY_MOVIE_PAGES = 4;
   const RELEASE_TYPE_MOVIE_PAGES = 4;
   type DiscoverTask = DiscoverArgs & {
     mediaType: MediaType;
@@ -731,6 +876,26 @@ export async function fetchUpcomingReleases(
               attributedProviderId: provider.id,
             });
           }
+        }
+      }
+    }
+
+    // --- D) Production-based (movie companies) ---
+    // This is the primary signal for movie ORIGINALS. Hitting
+    // with_companies=<id> per production entity is far more precise than
+    // relying on watch_providers lag for upcoming streaming movies.
+    if (includeMovies && provider.movieCompanyIds) {
+      for (const companyId of provider.movieCompanyIds) {
+        for (let p = 1; p <= COMPANY_MOVIE_PAGES; p++) {
+          discoverTasks.push({
+            mediaType: "movie",
+            region,
+            from,
+            to,
+            page: p,
+            companyId,
+            attributedProviderId: provider.id,
+          });
         }
       }
     }
@@ -929,6 +1094,14 @@ export async function fetchUpcomingReleases(
     if (detailRes.status !== "fulfilled") continue;
     const d = detailRes.value;
 
+    // ORIGINALITY GATE: drop anything whose production_companies (movies)
+    // or networks (TV) don't intersect an allowed streamer's declared
+    // original-producing entities. This is the single source of truth
+    // for "is this a streaming original" — watch_providers is purely
+    // informational downstream.
+    const attributedProviderIds = verifyAndAttributeOriginal(d, mediaType);
+    if (attributedProviderIds.size === 0) continue;
+
     const baseTitle = d.title || d.name || item.title || item.name || "Untitled";
     let title = baseTitle;
 
@@ -983,22 +1156,31 @@ export async function fetchUpcomingReleases(
     // or further out than we asked for.
     if (releaseDate < from || releaseDate > to) continue;
 
-    // Restrict to the ALLOWED_PROVIDERS list. If TMDB's watch/providers
-    // response has no allowed entry for this item (data lag), fall back to
-    // the set of allowed providers the discovery phase saw this item on.
+    // Build the displayed provider list as the UNION of:
+    //   (a) TMDB watch/providers entries filtered to our allow-list
+    //       (real-time "where to watch" data from TMDB)
+    //   (b) The attributedProviderIds we just verified via
+    //       production_companies / networks
+    // (a) alone would lose the badge when TMDB's per-region provider
+    // data hasn't landed yet (common for upcoming originals). (b) alone
+    // would ignore genuinely multi-service availability.
     const rawProviders = pickProviders(region, d["watch/providers"]);
-    let providers = rawProviders.filter((p) => ALLOWED_PROVIDER_ID_SET.has(p.id));
-    if (providers.length === 0) {
-      providers = Array.from(capped[i].discoveredFrom)
-        .filter((id) => ALLOWED_PROVIDER_ID_SET.has(id))
-        .map((id) => ({
+    const providerMap = new Map<number, StreamingProvider>();
+    for (const p of rawProviders) {
+      if (ALLOWED_PROVIDER_ID_SET.has(p.id)) providerMap.set(p.id, p);
+    }
+    for (const id of attributedProviderIds) {
+      if (!providerMap.has(id)) {
+        providerMap.set(id, {
           id,
           name: ALLOWED_PROVIDER_NAME_BY_ID.get(id) ?? `Provider ${id}`,
           logoPath: null,
-        }));
+        });
+      }
     }
-    // If we somehow still have nothing, skip the release entirely — it
-    // doesn't belong to any of our tracked services.
+    const providers = Array.from(providerMap.values());
+    // Attribution guarantees a non-empty set -- verifyAndAttributeOriginal
+    // already returned matches -- but keep the defensive drop.
     if (providers.length === 0) continue;
 
     const popularity = d.popularity ?? item.popularity ?? 0;
