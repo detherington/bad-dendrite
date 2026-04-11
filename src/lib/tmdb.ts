@@ -417,6 +417,30 @@ function computeStarPower(cast: TmdbCastEntry[] | undefined): number {
  *      the streamer's own production.
  *
  *  Returns null to signal "drop this item". */
+/** True when TMDB's release_dates contain a type 2 (Theatrical limited)
+ *  or type 3 (Theatrical) entry in ANY region but have NO type 4
+ *  (Digital) or type 6 (TV/Streaming) entry in any region. This is the
+ *  signature of a theatrical-only movie that hasn't been tagged with a
+ *  digital/streaming date yet — showing it with its theatrical date
+ *  would mislead the user into thinking it's arriving on streaming. */
+function isTheatricalOnly(details: TmdbDetails): boolean {
+  const regions = details.release_dates?.results;
+  if (!regions?.length) return false; // No data → can't tell; assume not theatrical
+  let hasTheatrical = false;
+  let hasDigital = false;
+  for (const r of regions) {
+    for (const rd of r.release_dates ?? []) {
+      if (rd.type === 2 || rd.type === 3) hasTheatrical = true;
+      if (rd.type === 4 || rd.type === 6) hasDigital = true;
+      // type 1 (Premiere) is often award-circuit screenings and isn't
+      // a reliable signal either way, so we ignore it.
+    }
+  }
+  // Only call it "theatrical" if there's at least one theatrical entry
+  // AND zero digital/streaming entries worldwide.
+  return hasTheatrical && !hasDigital;
+}
+
 function pickMovieReleaseDate(
   details: TmdbDetails,
   region: string,
@@ -441,7 +465,14 @@ function pickMovieReleaseDate(
 
   const primary = (details.release_date || "").slice(0, 10);
   if (primary && primary >= from && primary <= to) {
-    if (trustPrimary) return primary;
+    if (trustPrimary) {
+      // Even trusted sources (SA/Watchmode/scrapers) shouldn't use the
+      // primary date if it's clearly a theatrical-only movie. This
+      // catches titles that leak into Watchmode's /releases feed with
+      // their theatrical date but have no streaming date announced.
+      if (isTheatricalOnly(details)) return null;
+      return primary;
+    }
     const hasAnyTheatrical = details.release_dates?.results?.some((r) =>
       r.release_dates?.some((rd) => rd.type === 2 || rd.type === 3),
     );
@@ -1787,8 +1818,14 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       // Availability, or a scraper -- each of which tracks the actual
       // streamer release schedule better than TMDB's crowdsourced
       // release_dates. Fall through to pickMovieReleaseDate otherwise.
+      //
+      // Guard: even when the external source says "arriving on date X",
+      // reject the title if TMDB's release_dates say it's theatrical-
+      // only (type 2/3 with no type 4/6 anywhere). This catches
+      // theatrical movies that leak into Watchmode/SA feeds before a
+      // digital date has been announced.
       const saDate = candidate.saReleaseDate;
-      if (saDate && saDate >= from && saDate <= to) {
+      if (saDate && saDate >= from && saDate <= to && !isTheatricalOnly(d)) {
         releaseDate = saDate;
       } else {
         // For verified-original candidates, allow the primary release
@@ -1905,7 +1942,18 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     const rawProviders = pickProviders(region, d["watch/providers"]);
     const providerMap = new Map<number, StreamingProvider>();
     for (const p of rawProviders) {
-      if (ALLOWED_PROVIDER_ID_SET.has(p.id)) providerMap.set(p.id, p);
+      if (ALLOWED_PROVIDER_ID_SET.has(p.id)) {
+        // Always use our canonical name and hardcoded logo for known
+        // providers. TMDB's watch/providers payload can carry stale
+        // names (e.g. "HBO Max" for provider 1899 which rebranded to
+        // "Max") and broken/outdated logo_path references. Overriding
+        // both fields guarantees consistent badges everywhere.
+        providerMap.set(p.id, {
+          id: p.id,
+          name: ALLOWED_PROVIDER_NAME_BY_ID.get(p.id) ?? p.name,
+          logoPath: ALLOWED_PROVIDER_LOGO[p.id] ?? p.logoPath,
+        });
+      }
     }
     for (const id of attributedProviderIds) {
       if (!providerMap.has(id)) {
@@ -2000,6 +2048,42 @@ export async function fetchUpcomingReleasesWithDiagnostics(
   const deduped = dedupeById(releases).sort((a, b) =>
     a.releaseDate.localeCompare(b.releaseDate),
   );
+
+  // --- Phase 5: poster backfill for remaining nulls ----------------------
+  // Any release that still has posterPath === null after the 4-layer chain
+  // gets a targeted `/images` call WITHOUT a language filter (the detail
+  // fetch used `include_image_language=en,null`, which hides non-English
+  // posters). This catches international titles that only have posters in
+  // their original language. Capped at 50 to avoid blowing the TMDB
+  // budget on very sparse catalogs.
+  const posterless = deduped.filter((r) => r.posterPath == null);
+  if (posterless.length > 0) {
+    const cap = Math.min(posterless.length, 50);
+    const toBackfill = posterless.slice(0, cap);
+    const backfillResults = await runWithConcurrency(toBackfill, 15, async (r) => {
+      const endpoint = r.mediaType === "movie"
+        ? `/movie/${r.tmdbId}/images`
+        : `/tv/${r.tmdbId}/images`;
+      try {
+        return await tmdbFetch<TmdbImages>(endpoint, {
+          // No include_image_language — returns ALL languages.
+          params: {},
+        });
+      } catch {
+        return null;
+      }
+    });
+    for (let i = 0; i < toBackfill.length; i++) {
+      const res = backfillResults[i];
+      if (res.status !== "fulfilled" || !res.value) continue;
+      const poster = pickPosterFromImages(res.value);
+      if (poster) toBackfill[i].posterPath = poster;
+      if (!toBackfill[i].backdropPath) {
+        const backdrop = pickBackdropFromImages(res.value);
+        if (backdrop) toBackfill[i].backdropPath = backdrop;
+      }
+    }
+  }
 
   const diagnostics: ReleaseSourceDiagnostics = {
     region,
