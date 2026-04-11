@@ -27,7 +27,7 @@ function getAuth() {
 }
 
 export function getRegion(): string {
-  return (process.env.TMDB_REGION || "US").toUpperCase();
+  return (process.env.TMDB_REGION || "US").trim().toUpperCase();
 }
 
 async function tmdbFetch<T>(path: string, opts: TmdbFetchOptions = {}): Promise<T> {
