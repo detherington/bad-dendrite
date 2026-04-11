@@ -328,6 +328,16 @@ export interface SaDiagnostics {
    *  from the streaming options vs. dropped for lack of one. */
   itemsWithReleaseDate: number;
   itemsWithoutReleaseDate: number;
+  /** Breakdown of extracted entries by showType (movie vs series). */
+  moviesCount: number;
+  seriesCount: number;
+  /** Are SA's availableSince timestamps actually in the future (where
+   *  "upcoming" should put them)? `now` = the query time in Unix ms. */
+  releaseDatesInFuture: number;
+  releaseDatesInPast: number;
+  /** First 10 (tmdbId, releaseDate) pairs we extracted, for quick
+   *  inspection in the debug endpoint. */
+  sampleItems: Array<{ tmdbId: string; showType: string; releaseDate: string | null }>;
 }
 
 export interface SaFetchResult {
@@ -367,7 +377,13 @@ export async function fetchStreamingAvailabilityUpcoming(
     firstShowSample: null,
     itemsWithReleaseDate: 0,
     itemsWithoutReleaseDate: 0,
+    moviesCount: 0,
+    seriesCount: 0,
+    releaseDatesInFuture: 0,
+    releaseDatesInPast: 0,
+    sampleItems: [],
   };
+  const nowYmd = new Date().toISOString().slice(0, 10);
 
   if (!diagnostics.configured) {
     return { items: [], diagnostics };
@@ -463,8 +479,22 @@ export async function fetchStreamingAvailabilityUpcoming(
         if (!parsed) continue;
         if (releaseDate) {
           diagnostics.itemsWithReleaseDate++;
+          if (releaseDate >= nowYmd) {
+            diagnostics.releaseDatesInFuture++;
+          } else {
+            diagnostics.releaseDatesInPast++;
+          }
         } else {
           diagnostics.itemsWithoutReleaseDate++;
+        }
+        if (show.showType === "movie") diagnostics.moviesCount++;
+        else if (show.showType === "series") diagnostics.seriesCount++;
+        if (diagnostics.sampleItems.length < 10) {
+          diagnostics.sampleItems.push({
+            tmdbId: show.tmdbId ?? "",
+            showType: show.showType ?? "",
+            releaseDate,
+          });
         }
         const key = `${parsed.mediaType}-${parsed.id}`;
         const existing = results.get(key);

@@ -799,11 +799,13 @@ function dedupeById(releases: Release[]): Release[] {
 export interface ReleaseSourceDiagnostics {
   region: string;
   daysAhead: number;
+  window: { from: string; to: string };
   tmdb: {
     discoverTasks: number;
     discoverFulfilled: number;
     discoverRejected: number;
     uniqueCandidates: number;
+    candidatesVerifiedOriginal: number;
     detailFulfilled: number;
     detailRejected: number;
   };
@@ -811,6 +813,22 @@ export interface ReleaseSourceDiagnostics {
     episodes: number;
   };
   streamingAvailability: SaDiagnostics;
+  releaseLoop: {
+    entered: number;
+    droppedDetailFailed: number;
+    droppedPostFilter: number;
+    droppedNoReleaseDate: number;
+    droppedOutsideWindow: number;
+    droppedNoProviders: number;
+    kept: number;
+    keptMovies: number;
+    keptTv: number;
+    /** Breakdown of kept items by media type × verifiedOriginal source,
+     *  so we can see whether SA/company/network items are actually
+     *  contributing to the output. */
+    keptVerifiedOriginalMovies: number;
+    keptVerifiedOriginalTv: number;
+  };
   releasesAfterOriginalityFilter: number;
   releasesAfterDateClamp: number;
 }
@@ -1013,6 +1031,11 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     firstShowSample: null,
     itemsWithReleaseDate: 0,
     itemsWithoutReleaseDate: 0,
+    moviesCount: 0,
+    seriesCount: 0,
+    releaseDatesInFuture: 0,
+    releaseDatesInPast: 0,
+    sampleItems: [],
   };
   const [discoverResults, tvmazeEpisodes, saResult] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),
@@ -1242,12 +1265,37 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     return fetchSeasonVideos(c.item.id, season);
   });
 
+  // Counters for the release-loop drop reasons. Threaded into the
+  // diagnostics object so the debug endpoint shows exactly where each
+  // candidate died.
+  const loopCounts = {
+    entered: 0,
+    droppedDetailFailed: 0,
+    droppedPostFilter: 0,
+    droppedNoReleaseDate: 0,
+    droppedOutsideWindow: 0,
+    droppedNoProviders: 0,
+    kept: 0,
+    keptMovies: 0,
+    keptTv: 0,
+    keptVerifiedOriginalMovies: 0,
+    keptVerifiedOriginalTv: 0,
+  };
+  let candidatesVerifiedOriginal = 0;
+  for (const c of capped) {
+    if (c.verifiedOriginal) candidatesVerifiedOriginal++;
+  }
+
   const releases: Release[] = [];
   for (let i = 0; i < capped.length; i++) {
+    loopCounts.entered++;
     const candidate = capped[i];
     const { mediaType, item } = candidate;
     const detailRes = detailResults[i];
-    if (detailRes.status !== "fulfilled") continue;
+    if (detailRes.status !== "fulfilled") {
+      loopCounts.droppedDetailFailed++;
+      continue;
+    }
     const d = detailRes.value;
 
     // ORIGINALITY GATE: items flagged `verifiedOriginal` (discovered via
@@ -1267,7 +1315,10 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     } else {
       attributedProviderIds = verifyAndAttributeOriginal(d, mediaType);
     }
-    if (attributedProviderIds.size === 0) continue;
+    if (attributedProviderIds.size === 0) {
+      loopCounts.droppedPostFilter++;
+      continue;
+    }
 
     const baseTitle = d.title || d.name || item.title || item.name || "Untitled";
     let title = baseTitle;
@@ -1324,11 +1375,17 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       }
     }
 
-    if (!releaseDate) continue;
+    if (!releaseDate) {
+      loopCounts.droppedNoReleaseDate++;
+      continue;
+    }
     // Clamp to the requested window. TMDB's TV discover by air_date can return
     // shows whose *any* episode matches, but next_episode_to_air may be older
     // or further out than we asked for.
-    if (releaseDate < from || releaseDate > to) continue;
+    if (releaseDate < from || releaseDate > to) {
+      loopCounts.droppedOutsideWindow++;
+      continue;
+    }
 
     // Build the displayed provider list as the UNION of:
     //   (a) TMDB watch/providers entries filtered to our allow-list
@@ -1355,7 +1412,19 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     const providers = Array.from(providerMap.values());
     // Attribution guarantees a non-empty set -- verifyAndAttributeOriginal
     // already returned matches -- but keep the defensive drop.
-    if (providers.length === 0) continue;
+    if (providers.length === 0) {
+      loopCounts.droppedNoProviders++;
+      continue;
+    }
+
+    loopCounts.kept++;
+    if (mediaType === "movie") {
+      loopCounts.keptMovies++;
+      if (candidate.verifiedOriginal) loopCounts.keptVerifiedOriginalMovies++;
+    } else {
+      loopCounts.keptTv++;
+      if (candidate.verifiedOriginal) loopCounts.keptVerifiedOriginalTv++;
+    }
 
     const popularity = d.popularity ?? item.popularity ?? 0;
     const starPower = computeStarPower(d.credits?.cast);
@@ -1411,11 +1480,13 @@ export async function fetchUpcomingReleasesWithDiagnostics(
   const diagnostics: ReleaseSourceDiagnostics = {
     region,
     daysAhead,
+    window: { from, to },
     tmdb: {
       discoverTasks: discoverTasks.length,
       discoverFulfilled: discoverResults.filter((r) => r.status === "fulfilled").length,
       discoverRejected: discoverResults.filter((r) => r.status === "rejected").length,
       uniqueCandidates: uniqueCandidates.length,
+      candidatesVerifiedOriginal,
       detailFulfilled: detailResults.filter((r) => r.status === "fulfilled").length,
       detailRejected: detailResults.filter((r) => r.status === "rejected").length,
     },
@@ -1423,6 +1494,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
       episodes: tvmazeEpisodes.length,
     },
     streamingAvailability: saDiagnostics,
+    releaseLoop: loopCounts,
     releasesAfterOriginalityFilter: releases.length,
     releasesAfterDateClamp: deduped.length,
   };
