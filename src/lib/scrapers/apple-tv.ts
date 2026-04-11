@@ -81,17 +81,19 @@ export async function scrapeAppleTv(): Promise<ScraperResult> {
   const payloads = scanScriptsForJsonPayloads(root);
   let firstMatchingPayload: string | null = null;
   let scannedMatches = 0;
+  let largestPayload: { source: string; json: string } | null = null;
   for (const { value, source } of payloads) {
+    try {
+      const json = JSON.stringify(value);
+      if (!largestPayload || json.length > largestPayload.json.length) {
+        largestPayload = { source, json };
+      }
+    } catch {
+      /* skip */
+    }
     const items = walkForTitleDatePairs(value);
     if (items.length === 0) continue;
-    if (!firstMatchingPayload) {
-      firstMatchingPayload = source;
-      try {
-        diagnostic.nextDataSample = JSON.stringify(value).slice(0, 2000);
-      } catch {
-        /* ignore */
-      }
-    }
+    if (!firstMatchingPayload) firstMatchingPayload = source;
     scannedMatches += items.length;
     for (const item of items) {
       releases.push({
@@ -104,6 +106,9 @@ export async function scrapeAppleTv(): Promise<ScraperResult> {
         sourceUrl: ROOM_URL,
       });
     }
+  }
+  if (largestPayload) {
+    diagnostic.nextDataSample = `[${largestPayload.source}] ${largestPayload.json.slice(0, 4500)}`;
   }
   if (scannedMatches > 0) {
     diagnostic.parseStrategy = diagnostic.parseStrategy

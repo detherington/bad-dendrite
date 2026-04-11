@@ -86,23 +86,22 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
   if (releases.length > 0) diagnostic.parseStrategy = "json-ld";
 
   // ---- Strategy 2: aggressive <script> scan ------------------------------
-  // Try every plausible JSON-payload extractor against every script tag.
-  // Capture the first payload that produces any title/date pairs in the
-  // diagnostics so we can inspect the source when items look wrong.
   const payloads = scanScriptsForJsonPayloads(root);
   let firstMatchingPayload: string | null = null;
   let scannedMatches = 0;
+  let largestPayload: { source: string; json: string } | null = null;
   for (const { value, source } of payloads) {
+    try {
+      const json = JSON.stringify(value);
+      if (!largestPayload || json.length > largestPayload.json.length) {
+        largestPayload = { source, json };
+      }
+    } catch {
+      /* skip */
+    }
     const items = walkForTitleDatePairs(value);
     if (items.length === 0) continue;
-    if (!firstMatchingPayload) {
-      firstMatchingPayload = source;
-      try {
-        diagnostic.nextDataSample = JSON.stringify(value).slice(0, 2000);
-      } catch {
-        /* ignore */
-      }
-    }
+    if (!firstMatchingPayload) firstMatchingPayload = source;
     scannedMatches += items.length;
     for (const item of items) {
       releases.push({
@@ -115,6 +114,9 @@ export async function scrapeNetflixTudum(): Promise<ScraperResult> {
         sourceUrl: TUDUM_URL,
       });
     }
+  }
+  if (largestPayload) {
+    diagnostic.nextDataSample = `[${largestPayload.source}] ${largestPayload.json.slice(0, 4500)}`;
   }
   if (scannedMatches > 0) {
     diagnostic.parseStrategy = diagnostic.parseStrategy

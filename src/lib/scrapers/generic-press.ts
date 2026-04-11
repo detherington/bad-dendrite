@@ -119,17 +119,22 @@ async function scrapeOne(
   const payloads = scanScriptsForJsonPayloads(root);
   let firstMatchingPayload: string | null = null;
   let scannedMatches = 0;
+  // Track the largest parsed payload so we can show its shape in
+  // diagnostics even when the walker finds zero title/date pairs —
+  // that's the hint we need to widen the walker's key sets.
+  let largestPayload: { source: string; json: string } | null = null;
   for (const { value, source } of payloads) {
+    try {
+      const json = JSON.stringify(value);
+      if (!largestPayload || json.length > largestPayload.json.length) {
+        largestPayload = { source, json };
+      }
+    } catch {
+      /* skip unstringifiable */
+    }
     const items = walkForTitleDatePairs(value);
     if (items.length === 0) continue;
-    if (!firstMatchingPayload) {
-      firstMatchingPayload = source;
-      try {
-        diagnostic.nextDataSample = JSON.stringify(value).slice(0, 2000);
-      } catch {
-        /* ignore */
-      }
-    }
+    if (!firstMatchingPayload) firstMatchingPayload = source;
     scannedMatches += items.length;
     for (const item of items) {
       releases.push({
@@ -143,6 +148,9 @@ async function scrapeOne(
         sourceUrl: url,
       });
     }
+  }
+  if (largestPayload) {
+    diagnostic.nextDataSample = `[${largestPayload.source}] ${largestPayload.json.slice(0, 4500)}`;
   }
   if (scannedMatches > 0) {
     diagnostic.parseStrategy = diagnostic.parseStrategy
