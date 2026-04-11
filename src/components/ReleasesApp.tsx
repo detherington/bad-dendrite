@@ -6,6 +6,7 @@ import { ListView } from "./ListView";
 import { CalendarView } from "./CalendarView";
 import { ReleaseDetailModal } from "./ReleaseDetailModal";
 import { Filters, type FilterState } from "./Filters";
+import { FeaturedBanner } from "./FeaturedBanner";
 
 type ViewMode = "list" | "calendar";
 
@@ -73,6 +74,8 @@ export function ReleasesApp({ initial }: Props) {
         </div>
         <ViewToggle view={view} onChange={setView} />
       </header>
+
+      <FeaturedBanner releases={initial.releases} onSelect={setSelected} />
 
       <Filters
         filters={filters}

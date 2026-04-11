@@ -1,5 +1,6 @@
 import type {
   CastMember,
+  HighlightKind,
   MediaType,
   Release,
   StreamingProvider,
@@ -74,6 +75,7 @@ interface TmdbDiscoverItem {
   release_date?: string;
   first_air_date?: string;
   vote_average: number;
+  popularity: number;
   genre_ids: number[];
 }
 
@@ -105,6 +107,7 @@ interface TmdbCastEntry {
   character?: string;
   profile_path: string | null;
   order: number;
+  popularity?: number;
   known_for_department?: string;
 }
 
@@ -139,6 +142,7 @@ interface TmdbDetails {
   release_date?: string;
   first_air_date?: string;
   vote_average: number;
+  popularity: number;
   genres: TmdbGenre[];
   next_episode_to_air?: TmdbEpisodeInfo | null;
   last_episode_to_air?: TmdbEpisodeInfo | null;
@@ -185,7 +189,15 @@ function pickCast(cast: TmdbCastEntry[] | undefined, limit = 6): CastMember[] {
       name: c.name,
       character: c.character || null,
       profilePath: c.profile_path,
+      popularity: c.popularity ?? 0,
     }));
+}
+
+function computeStarPower(cast: TmdbCastEntry[] | undefined): number {
+  if (!cast || cast.length === 0) return 0;
+  // Sum the top 3 cast popularities as a rough proxy for "big stars attached."
+  const sorted = [...cast].sort((a, b) => (b.popularity ?? 0) - (a.popularity ?? 0));
+  return sorted.slice(0, 3).reduce((acc, c) => acc + (c.popularity ?? 0), 0);
 }
 
 function pickProviders(
@@ -348,26 +360,48 @@ export async function fetchUpcomingReleases(
     if (detailRes.status !== "fulfilled") continue;
     const d = detailRes.value;
 
-    let title = d.title || d.name || item.title || item.name || "Untitled";
+    const baseTitle = d.title || d.name || item.title || item.name || "Untitled";
+    let title = baseTitle;
 
-    // Choose the release date.
-    // - Movies: primary release date.
+    // Choose the release date AND classify the "event kind":
+    // - Movies: primary release date; kind = movie-release.
     // - TV: prefer next_episode_to_air.air_date so we surface upcoming seasons
     //   and episodes rather than the show's original launch date.
+    //     - S1E1      -> series-premiere
+    //     - S>1 E1    -> season-premiere
+    //     - E>1       -> episode (mid-season; excluded from banner)
+    //   If there is no next_episode_to_air but the first_air_date is in the
+    //   future, treat as a brand-new series that simply has no schedule yet.
     let releaseDate: string | undefined;
+    let highlightKind: HighlightKind;
+    let highlightLabel: string | null = null;
+
     if (mediaType === "movie") {
       releaseDate = d.release_date || item.release_date;
+      highlightKind = "movie-release";
+      highlightLabel = "New Movie";
     } else {
       const nextEp = d.next_episode_to_air;
       if (nextEp?.air_date) {
         releaseDate = nextEp.air_date;
-        const label =
-          nextEp.episode_number === 1
-            ? `Season ${nextEp.season_number} Premiere`
-            : `S${nextEp.season_number} \u00b7 E${nextEp.episode_number}`;
-        title = `${title} \u2014 ${label}`;
+        if (nextEp.episode_number === 1 && nextEp.season_number === 1) {
+          highlightKind = "series-premiere";
+          highlightLabel = "Series Premiere";
+          title = `${baseTitle} \u2014 Series Premiere`;
+        } else if (nextEp.episode_number === 1) {
+          highlightKind = "season-premiere";
+          highlightLabel = `Season ${nextEp.season_number} Premiere`;
+          title = `${baseTitle} \u2014 Season ${nextEp.season_number} Premiere`;
+        } else {
+          highlightKind = "episode";
+          highlightLabel = null;
+          title = `${baseTitle} \u2014 S${nextEp.season_number} \u00b7 E${nextEp.episode_number}`;
+        }
       } else {
         releaseDate = d.first_air_date || item.first_air_date;
+        highlightKind = "series-premiere";
+        highlightLabel = "Series Premiere";
+        title = `${baseTitle} \u2014 Series Premiere`;
       }
     }
 
@@ -382,21 +416,29 @@ export async function fetchUpcomingReleases(
     // the discover call already filtered by streaming monetization, so these
     // ARE on a streaming service -- TMDB just hasn't populated the logos yet.
 
+    const popularity = d.popularity ?? item.popularity ?? 0;
+    const starPower = computeStarPower(d.credits?.cast);
+
     releases.push({
       id: `${mediaType}-${d.id}`,
       tmdbId: d.id,
       mediaType,
       title,
+      baseTitle,
       overview: d.overview || item.overview || "",
       releaseDate,
       releaseTime: null, // TMDB doesn't expose a per-region time
       posterPath: d.poster_path ?? item.poster_path,
       backdropPath: d.backdrop_path ?? item.backdrop_path,
       voteAverage: d.vote_average ?? item.vote_average ?? 0,
+      popularity,
+      starPower,
       genres: (d.genres || []).map((g) => g.name),
       cast: pickCast(d.credits?.cast),
       trailer: pickTrailer(d.videos?.results),
       streamingProviders: providers,
+      highlightKind,
+      highlightLabel,
       tmdbUrl:
         mediaType === "movie"
           ? `https://www.themoviedb.org/movie/${d.id}`
