@@ -41,7 +41,26 @@ TMDB_API_KEY=<your v3 api key>
 
 # Optional: ISO 3166-1 country code for provider lookups
 TMDB_REGION=US
+
+# Optional: Streaming Availability API via RapidAPI. When set, the app
+# supplements TMDB discovery with Movie of the Night's per-provider
+# "upcoming additions" feed — the biggest single lift to Netflix /
+# HBO / Apple TV+ coverage for "coming soon" titles that TMDB hasn't
+# tagged with a regional provider yet.
+STREAMING_AVAILABILITY_API_KEY=<your RapidAPI key>
 ```
+
+### Data sources
+
+Discovery is layered across several free and paid APIs, each targeting
+a different coverage gap. The app gracefully degrades if an optional
+source is not configured.
+
+| Source                          | Required | What it fills in                                                                                                         |
+| ------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------ |
+| TMDB `/discover/movie` + `/discover/tv` | Yes   | Base catalog: per-provider `watch_providers` + production-based `with_networks` + digital `with_release_type=4\|6` passes |
+| TVmaze `/schedule/web`          | No (free, no key) | Weekly episode drops and near-term streaming TV that TMDB's availability layer hasn't flagged yet                         |
+| Streaming Availability (RapidAPI) | No     | Per-provider "coming soon" feed sourced from JustWatch + each service directly. Biggest single coverage lift when enabled. |
 
 ### 3. Install and run
 

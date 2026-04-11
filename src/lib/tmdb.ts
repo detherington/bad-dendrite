@@ -12,6 +12,11 @@ import {
   type TvmazeEpisode,
   type TvmazeShow,
 } from "./tvmaze";
+import {
+  fetchStreamingAvailabilityUpcoming,
+  isStreamingAvailabilityConfigured,
+  type SaUpcoming,
+} from "./streaming-availability";
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 
@@ -662,13 +667,19 @@ export async function fetchUpcomingReleases(
     }
   }
 
-  // Run TMDB discovery and TVmaze /schedule/web in parallel. TVmaze has no
-  // dependency on TMDB's response, so there's no reason to serialize.
-  const [discoverResults, tvmazeEpisodes] = await Promise.all([
+  // Run TMDB discovery, TVmaze /schedule/web, and Streaming Availability
+  // /changes in parallel. None of them depend on each other's output at
+  // this phase, so cold-fetch latency is max(A, B, C) rather than A+B+C.
+  const [discoverResults, tvmazeEpisodes, saResults] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),
     includeTv
       ? fetchTvmazeWebSchedule(from, to, region).catch(() => [] as TvmazeEpisode[])
       : Promise.resolve([] as TvmazeEpisode[]),
+    isStreamingAvailabilityConfigured()
+      ? fetchStreamingAvailabilityUpcoming(region, ALLOWED_PROVIDER_IDS).catch(
+          () => [] as SaUpcoming[],
+        )
+      : Promise.resolve([] as SaUpcoming[]),
   ]);
 
   // Track which allowed providers each candidate was discovered under. If
@@ -706,6 +717,37 @@ export async function fetchUpcomingReleases(
       }
     }
   });
+  // --- Phase 1a': Streaming Availability injection ------------------------
+  // SA returns TMDB ids directly, so we can inject them into candidatesByKey
+  // without a name-search step. For items we've already seen from TMDB
+  // discovery, just merge the provider attribution into discoveredFrom.
+  // For items we haven't, create a stub TmdbDiscoverItem — the downstream
+  // detail fetch will replace every field from the real TMDB response.
+  if (saResults.length > 0) {
+    for (const sa of saResults) {
+      const key = `${sa.mediaType}-${sa.tmdbId}`;
+      const existing = candidatesByKey.get(key);
+      if (existing) {
+        for (const pid of sa.providerIds) existing.discoveredFrom.add(pid);
+        continue;
+      }
+      const stubItem: TmdbDiscoverItem = {
+        id: sa.tmdbId,
+        overview: "",
+        poster_path: null,
+        backdrop_path: null,
+        vote_average: 0,
+        popularity: 0,
+        genre_ids: [],
+      };
+      candidatesByKey.set(key, {
+        mediaType: sa.mediaType,
+        item: stubItem,
+        discoveredFrom: new Set(sa.providerIds),
+      });
+    }
+  }
+
   // --- Phase 1b: TVmaze supplementation ------------------------------------
   // TVmaze's per-day /schedule/web is aggressively maintained for streaming
   // ("web channel") shows, so it catches upcoming TV that TMDB's availability
