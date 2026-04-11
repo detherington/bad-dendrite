@@ -295,13 +295,69 @@ export interface FetchReleasesOptions {
   region?: string;
 }
 
-async function discover(
-  mediaType: MediaType,
-  region: string,
-  from: string,
-  to: string,
-  page: number,
-): Promise<TmdbDiscoverResponse> {
+/**
+ * TMDB watch-provider IDs for the streamers we explicitly fan out against.
+ * Provider-agnostic /discover sorts globally by popularity, which means low-
+ * profile titles from any single service (unscripted, docs, international,
+ * mid-tier originals) never make the top pages. Fetching per provider gives
+ * each service a guaranteed allocation so Netflix doesn't have to compete
+ * with Prime Video for the same 60 slots.
+ */
+const MAJOR_PROVIDER_IDS: ReadonlyArray<number> = [
+  8, // Netflix
+  9, // Amazon Prime Video
+  337, // Disney Plus
+  1899, // Max (HBO)
+  384, // HBO Max (legacy — still returns data in some regions)
+  15, // Hulu
+  350, // Apple TV+
+  531, // Paramount+
+  386, // Peacock Premium
+  283, // Crunchyroll
+  387, // Peacock Premium Plus
+  1770, // Paramount+ with Showtime
+];
+
+/** Bounded-concurrency runner so we don't blast TMDB with hundreds of
+ *  parallel requests and get rate-limited. */
+async function runWithConcurrency<T, R>(
+  items: ReadonlyArray<T>,
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      try {
+        const value = await fn(items[index], index);
+        results[index] = { status: "fulfilled", value };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+interface DiscoverArgs {
+  mediaType: MediaType;
+  region: string;
+  from: string;
+  to: string;
+  page: number;
+  /** Optional TMDB provider id to scope to a single streamer. */
+  providerId?: number;
+  /** Override the default TV sort (popularity.desc) for a second pass. */
+  tvSort?: "popularity.desc" | "first_air_date.desc";
+}
+
+async function discover(args: DiscoverArgs): Promise<TmdbDiscoverResponse> {
+  const { mediaType, region, from, to, page, providerId, tvSort } = args;
   const isMovie = mediaType === "movie";
   // Movies: filter and sort by primary_release_date (simple case).
   // TV: filter by `air_date` so we catch new SEASONS and EPISODES of existing
@@ -312,11 +368,14 @@ async function discover(
     include_adult: "false",
     include_video: "false",
     language: "en-US",
-    sort_by: isMovie ? "primary_release_date.asc" : "popularity.desc",
+    sort_by: isMovie ? "primary_release_date.asc" : tvSort ?? "popularity.desc",
     watch_region: region,
     with_watch_monetization_types: "flatrate|free|ads",
     page,
   };
+  if (providerId != null) {
+    params.with_watch_providers = providerId;
+  }
   if (isMovie) {
     params["primary_release_date.gte"] = from;
     params["primary_release_date.lte"] = to;
@@ -379,79 +438,105 @@ export async function fetchUpcomingReleases(
 ): Promise<Release[]> {
   const region = (opts.region || getRegion()).toUpperCase();
   const daysAhead = opts.daysAhead ?? 90;
-  const maxItems = opts.maxItems ?? 240;
+  const maxItems = opts.maxItems ?? 500;
   const includeMovies = opts.includeMovies ?? true;
   const includeTv = opts.includeTv ?? true;
-  const pagesPerType = 3;
 
   const now = new Date();
   const from = toYmd(now);
   const endDate = new Date(now.getTime() + daysAhead * 24 * 60 * 60 * 1000);
   const to = toYmd(endDate);
 
-  const discoverCalls: Array<Promise<TmdbDiscoverResponse>> = [];
+  // --- Phase 1: discovery ---------------------------------------------------
+  // We build a task list of discover calls:
+  //   (a) Generic region-wide queries (3 pages per media type) to catch the
+  //       long tail of smaller providers we don't explicitly enumerate.
+  //   (b) Per-provider queries against MAJOR_PROVIDER_IDS (2 pages per
+  //       (provider x media-type)). This guarantees each major streamer its
+  //       own allocation instead of competing globally with blockbusters for
+  //       the top 60 slots.
+  //   (c) A second TV pass sorted by first_air_date.desc, to surface brand
+  //       new series that popularity sort misses.
+  const GENERIC_PAGES = 3;
+  const PROVIDER_PAGES = 2;
+  type DiscoverTask = DiscoverArgs & { mediaType: MediaType };
+  const discoverTasks: DiscoverTask[] = [];
+
   if (includeMovies) {
-    for (let p = 1; p <= pagesPerType; p++) {
-      discoverCalls.push(discover("movie", region, from, to, p));
+    for (let p = 1; p <= GENERIC_PAGES; p++) {
+      discoverTasks.push({ mediaType: "movie", region, from, to, page: p });
     }
   }
   if (includeTv) {
-    for (let p = 1; p <= pagesPerType; p++) {
-      discoverCalls.push(discover("tv", region, from, to, p));
+    for (let p = 1; p <= GENERIC_PAGES; p++) {
+      discoverTasks.push({ mediaType: "tv", region, from, to, page: p });
+    }
+    // Second pass sorted by first_air_date.desc for new-series coverage.
+    for (let p = 1; p <= 2; p++) {
+      discoverTasks.push({
+        mediaType: "tv",
+        region,
+        from,
+        to,
+        page: p,
+        tvSort: "first_air_date.desc",
+      });
     }
   }
 
-  const discoverResults = await Promise.allSettled(discoverCalls);
-
-  type Candidate = { mediaType: MediaType; item: TmdbDiscoverItem };
-  const candidates: Candidate[] = [];
-  let resultIdx = 0;
-  if (includeMovies) {
-    for (let i = 0; i < pagesPerType; i++) {
-      const r = discoverResults[resultIdx++];
-      if (r.status === "fulfilled") {
-        for (const item of r.value.results) candidates.push({ mediaType: "movie", item });
+  for (const providerId of MAJOR_PROVIDER_IDS) {
+    if (includeMovies) {
+      for (let p = 1; p <= PROVIDER_PAGES; p++) {
+        discoverTasks.push({ mediaType: "movie", region, from, to, page: p, providerId });
+      }
+    }
+    if (includeTv) {
+      for (let p = 1; p <= PROVIDER_PAGES; p++) {
+        discoverTasks.push({ mediaType: "tv", region, from, to, page: p, providerId });
       }
     }
   }
-  if (includeTv) {
-    for (let i = 0; i < pagesPerType; i++) {
-      const r = discoverResults[resultIdx++];
-      if (r.status === "fulfilled") {
-        for (const item of r.value.results) candidates.push({ mediaType: "tv", item });
-      }
-    }
-  }
 
-  // Dedupe candidates by (mediaType, id) before spending detail-fetch budget.
-  const seenCandidate = new Set<string>();
-  const uniqueCandidates = candidates.filter((c) => {
-    const key = `${c.mediaType}-${c.item.id}`;
-    if (seenCandidate.has(key)) return false;
-    seenCandidate.add(key);
-    return true;
-  });
-
-  const capped = uniqueCandidates.slice(0, maxItems);
-
-  const detailResults = await Promise.allSettled(
-    capped.map((c) => fetchDetails(c.mediaType, c.item.id)),
+  const discoverResults = await runWithConcurrency(discoverTasks, 10, (task) =>
+    discover(task),
   );
 
+  type Candidate = { mediaType: MediaType; item: TmdbDiscoverItem };
+  const candidatesByKey = new Map<string, Candidate>();
+  discoverResults.forEach((res, i) => {
+    if (res.status !== "fulfilled") return;
+    const mediaType = discoverTasks[i].mediaType;
+    for (const item of res.value.results) {
+      const key = `${mediaType}-${item.id}`;
+      if (!candidatesByKey.has(key)) {
+        candidatesByKey.set(key, { mediaType, item });
+      }
+    }
+  });
+  const uniqueCandidates = Array.from(candidatesByKey.values());
+
+  // --- Phase 2: detail fetches ---------------------------------------------
+  // Keep a hard cap so a very crowded region can't run away, but the cap is
+  // now generous enough to comfortably cover every MAJOR_PROVIDER_IDS entry.
+  const capped = uniqueCandidates.slice(0, maxItems);
+
+  const detailResults = await runWithConcurrency(capped, 15, (c) =>
+    fetchDetails(c.mediaType, c.item.id),
+  );
+
+  // --- Phase 3: season-level videos (TV only) ------------------------------
   // For TV entries whose next event is a specific season, also fetch that
   // season's videos. Season-level trailers are often stored only on the
   // season endpoint (not the top-level /tv/{id}/videos), which is why
   // "Season 1 Trailer" used to leak through for Season 3 premieres.
-  const seasonVideoResults = await Promise.all(
-    capped.map(async (c, i) => {
-      if (c.mediaType !== "tv") return null;
-      const detail = detailResults[i];
-      if (detail.status !== "fulfilled") return null;
-      const season = detail.value.next_episode_to_air?.season_number;
-      if (season == null || season <= 0) return null;
-      return fetchSeasonVideos(c.item.id, season);
-    }),
-  );
+  const seasonVideoResults = await runWithConcurrency(capped, 15, async (c, i) => {
+    if (c.mediaType !== "tv") return null;
+    const detail = detailResults[i];
+    if (detail.status !== "fulfilled") return null;
+    const season = detail.value.next_episode_to_air?.season_number;
+    if (season == null || season <= 0) return null;
+    return fetchSeasonVideos(c.item.id, season);
+  });
 
   const releases: Release[] = [];
   for (let i = 0; i < capped.length; i++) {
@@ -523,7 +608,11 @@ export async function fetchUpcomingReleases(
     // videos come first so that when two entries have equal scores, the
     // season-scoped one wins (tiebreak via sort stability).
     const showVideos = d.videos?.results ?? [];
-    const seasonVideos = seasonVideoResults[i] ?? [];
+    const seasonVideoRes = seasonVideoResults[i];
+    const seasonVideos =
+      seasonVideoRes?.status === "fulfilled" && seasonVideoRes.value
+        ? seasonVideoRes.value
+        : [];
     const mergedVideoMap = new Map<string, TmdbVideo>();
     for (const v of [...seasonVideos, ...showVideos]) {
       if (!mergedVideoMap.has(v.id)) mergedVideoMap.set(v.id, v);
