@@ -9,6 +9,7 @@ import { scrapeMaxPress } from "./max-press";
 import { scrapeNetflixTudum } from "./netflix-tudum";
 import { scrapePeacock } from "./peacock";
 import { scrapePrimeVideo } from "./prime-video";
+import { scrapeWikipedia } from "./wikipedia";
 import type {
   Scraper,
   ScrapedRelease,
@@ -17,6 +18,13 @@ import type {
 } from "./types";
 
 const SCRAPERS: Array<{ name: string; fn: Scraper }> = [
+  // Wikipedia is the primary source -- curated "Upcoming" sections
+  // on "List of <streamer> original programming" pages are the only
+  // place that reliably has server-rendered, parseable data for all
+  // streamers. Every other scraper below is a secondary source that
+  // may or may not find anything depending on whether the streamer's
+  // site is an SPA with no SSR content (most of them currently are).
+  { name: "wikipedia", fn: scrapeWikipedia },
   { name: "netflix-tudum", fn: scrapeNetflixTudum },
   { name: "disney-press", fn: scrapeDisneyPress },
   { name: "apple-tv", fn: scrapeAppleTv },
