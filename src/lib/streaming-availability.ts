@@ -13,6 +13,18 @@
 const SA_BASE = "https://streaming-availability.p.rapidapi.com";
 const SA_HOST = "streaming-availability.p.rapidapi.com";
 
+/**
+ * Cache TTL for Streaming Availability responses. Sized to keep total
+ * monthly API usage comfortably under the RapidAPI free tier's 1,000
+ * request/month cap.
+ *
+ * Budget math at 48h: 7 providers × 4 pages × (30 days / 2 days) =
+ * ~420 calls/month, leaving ~58% headroom for multi-region cache misses
+ * and the occasional early eviction. "Coming soon" data doesn't need to
+ * be more than a couple of days fresh, so a 48h window is a safe cap.
+ */
+const SA_CACHE_SECONDS = 60 * 60 * 48; // 48h
+
 export class StreamingAvailabilityConfigError extends Error {}
 
 function getKey(): string | null {
@@ -116,9 +128,10 @@ async function saFetch<T>(path: string, params: Record<string, string>): Promise
       "x-rapidapi-host": SA_HOST,
       accept: "application/json",
     },
-    // Align with the TMDB + TVmaze cache window so a single page view
-    // doesn't refetch from multiple sources at different cadences.
-    next: { revalidate: 60 * 60 * 6 },
+    // See SA_CACHE_SECONDS: longer than the 6h cache used for TMDB /
+    // TVmaze because SA is a paid API and we need to fit monthly usage
+    // under the RapidAPI free tier's 1,000 request cap.
+    next: { revalidate: SA_CACHE_SECONDS },
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
