@@ -73,6 +73,43 @@ by the UI:
 
 Response cached for 6 hours at the edge (`s-maxage=21600`).
 
+## Deploying to Vercel
+
+This app is a standard Next.js 14 App Router project with no custom runtime
+config, so Vercel deploys it with zero changes.
+
+1. Push this repo to GitHub (or GitLab / Bitbucket).
+2. Go to [vercel.com/new](https://vercel.com/new) and import the repo. Vercel
+   auto-detects the Next.js framework preset &mdash; accept the defaults.
+3. Under **Environment Variables**, add:
+   - `TMDB_READ_TOKEN` &mdash; your TMDB v4 read access token (recommended), **or**
+   - `TMDB_API_KEY` &mdash; your TMDB v3 API key.
+   - `TMDB_REGION` &mdash; optional, e.g. `US`, `GB`, `CA`, `AU`.
+
+   Add them for all environments (Production, Preview, Development).
+4. Click **Deploy**.
+
+### How caching works on Vercel
+
+- The page is marked `dynamic = "force-dynamic"` so it doesn't try to
+  prerender at build time (no TMDB call happens during `next build`).
+- At request time, the TMDB `fetch` calls in `src/lib/tmdb.ts` use
+  `next: { revalidate: 21600 }`, so responses land in the Vercel Data Cache
+  and are reused for 6 hours across requests and serverless instances.
+- `GET /api/releases` additionally sets
+  `Cache-Control: public, s-maxage=21600, stale-while-revalidate=86400`, so
+  Vercel's edge cache will serve stale JSON while refreshing in the
+  background.
+
+Net result: TMDB is only called roughly every 6 hours per region/filter
+combination, well inside TMDB's rate limits.
+
+### Updating environment variables
+
+If you change a TMDB env var in Vercel's dashboard, redeploy (the Data Cache
+is built from the last deployment's environment). Re-clicking **Redeploy**
+from the latest production deployment is the fastest way.
+
 ## Notes and limitations
 
 - TMDB exposes release **dates** but not regional release **times**, so the

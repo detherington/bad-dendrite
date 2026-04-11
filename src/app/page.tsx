@@ -3,8 +3,11 @@ import { ReleasesApp } from "@/components/ReleasesApp";
 import { fetchUpcomingReleases, getRegion, TmdbConfigError } from "@/lib/tmdb";
 import type { ReleasesResponse } from "@/lib/types";
 
+// Don't prerender at build time (avoids build failure when TMDB env vars are
+// absent locally). At request time, the underlying TMDB fetches in
+// `src/lib/tmdb.ts` are cached via the Next.js Data Cache for 6 hours, so
+// Vercel won't hammer TMDB on every request.
 export const dynamic = "force-dynamic";
-export const revalidate = 0;
 
 async function loadReleases(): Promise<
   { ok: true; data: ReleasesResponse } | { ok: false; error: string; code?: string }

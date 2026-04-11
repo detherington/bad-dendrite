@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "Upcoming streaming movie and TV show releases, with calendar and list views.",
+  "engines": {
+    "node": ">=18.17.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
