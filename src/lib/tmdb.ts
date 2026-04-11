@@ -690,7 +690,7 @@ const ALLOWED_PROVIDERS: ReadonlyArray<AllowedProvider> = [
   },
   {
     id: 1899,
-    name: "Max",
+    name: "HBO Max",
     tvNetworkIds: [49, 3186],
     tvNetworkNamePatterns: ["hbo", "max"],
     movieCompanyIds: [174, 12, 9993, 429, 2785, 5820],
@@ -725,7 +725,7 @@ const ALLOWED_PROVIDER_LOGO: Record<number, string> = {
   9: "/emthp39XA2YScoYL1p0sdbAH2WA.jpg", // Amazon Prime Video
   15: "/zxrVdFjIjLqkfnwyghnfywTn3Lh.jpg", // Hulu
   386: "/xTHltMrZPAJFLQ6qyCBjAnXSmZt.jpg", // Peacock
-  1899: "/6Q3KKKLC5RlFhubXgazRgN1a2Jb.jpg", // Max
+  1899: "/6Q3KKKLC5RlFhubXgazRgN1a2Jb.jpg", // HBO Max
 };
 
 /** Bounded-concurrency runner so we don't blast TMDB with hundreds of
@@ -1944,10 +1944,9 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     for (const p of rawProviders) {
       if (ALLOWED_PROVIDER_ID_SET.has(p.id)) {
         // Always use our canonical name and hardcoded logo for known
-        // providers. TMDB's watch/providers payload can carry stale
-        // names (e.g. "HBO Max" for provider 1899 which rebranded to
-        // "Max") and broken/outdated logo_path references. Overriding
-        // both fields guarantees consistent badges everywhere.
+        // providers. TMDB's watch/providers payload can carry
+        // inconsistent names or outdated logo_path references.
+        // Overriding both fields guarantees consistent badges.
         providerMap.set(p.id, {
           id: p.id,
           name: ALLOWED_PROVIDER_NAME_BY_ID.get(p.id) ?? p.name,

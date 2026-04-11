@@ -113,7 +113,7 @@ const TMDB_PROVIDER_TO_SA_CATALOG: Record<number, string> = {
   9: "prime", // Amazon Prime Video
   15: "hulu", // Hulu
   386: "peacock", // Peacock
-  1899: "hbo", // Max (formerly HBO Max)
+  1899: "hbo", // HBO Max
 };
 
 // ---------- Helpers ----------

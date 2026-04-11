@@ -83,7 +83,7 @@ const WATCHMODE_SOURCE_TO_TMDB: Record<number, number> = {
   157: 15, // Hulu
   26: 9, // Amazon Prime Video
   372: 337, // Disney+
-  387: 1899, // HBO Max / Max
+  387: 1899, // HBO Max
   371: 350, // Apple TV+
   389: 386, // Peacock
 };
