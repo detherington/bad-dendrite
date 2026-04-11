@@ -314,7 +314,6 @@ const ALLOWED_PROVIDERS: ReadonlyArray<AllowedProvider> = [
   { id: 15, name: "Hulu" },
   { id: 386, name: "Peacock Premium" },
   { id: 1899, name: "Max" },
-  { id: 283, name: "Crunchyroll" },
 ];
 
 const ALLOWED_PROVIDER_IDS: ReadonlyArray<number> = ALLOWED_PROVIDERS.map((p) => p.id);
