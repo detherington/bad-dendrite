@@ -14,13 +14,8 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
     tmdbImage(release.posterPath, compact ? "w185" : "w342") ??
     tmdbImage(release.backdropPath, compact ? "w185" : "w342");
   const stars = release.cast.slice(0, 3).map((c) => c.name).join(", ");
-  const initials = release.baseTitle
-    .split(/[\s:]+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((w) => w[0])
-    .join("")
-    .toUpperCase();
+  const leadProvider = release.streamingProviders[0];
+  const providerLogo = leadProvider ? tmdbImage(leadProvider.logoPath, "w92") : null;
 
   return (
     <button
@@ -38,9 +33,16 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
             loading="lazy"
           />
         ) : (
-          <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-gradient-to-b from-ink-700/50 to-ink-800/80">
-            <span className="text-2xl font-bold text-ink-500">{initials}</span>
-            <span className="text-[9px] text-ink-500">{release.mediaType === "movie" ? "Film" : "Series"}</span>
+          <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-gradient-to-b from-ink-700/40 to-ink-800/80 px-2">
+            {providerLogo ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={providerLogo} alt="" className="h-8 w-8 rounded object-cover opacity-60" />
+            ) : (
+              <span className="text-lg font-bold text-ink-500">{release.mediaType === "movie" ? "Film" : "TV"}</span>
+            )}
+            <span className="line-clamp-2 text-center text-[10px] font-medium leading-tight text-ink-400">
+              {release.baseTitle}
+            </span>
           </div>
         )}
       </div>

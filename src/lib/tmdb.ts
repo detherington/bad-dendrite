@@ -2056,11 +2056,18 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     //   3. season poster — from /tv/{id}/season/{n} (new shows often
     //      have season art before the show-level poster)
     //   4. item.poster_path — discover stub / Watchmode's poster_url
+    //   5. Lead cast member's profile photo — comedy specials, stand-up
+    //      shows, and documentaries often have zero art in TMDB but the
+    //      performer's headshot works great as a poster (portrait crop,
+    //      the performer IS the content)
+    const leadCastPhoto =
+      d.credits?.cast?.[0]?.profile_path ?? null;
     const posterPath =
       d.poster_path ??
       pickPosterFromImages(d.images) ??
       seasonExtra?.seasonPosterPath ??
-      item.poster_path;
+      item.poster_path ??
+      leadCastPhoto;
     const backdropPath =
       d.backdrop_path ??
       pickBackdropFromImages(d.images) ??
@@ -2097,38 +2104,89 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     a.releaseDate.localeCompare(b.releaseDate),
   );
 
-  // --- Phase 5: poster backfill for remaining nulls ----------------------
-  // Any release that still has posterPath === null after the 4-layer chain
-  // gets a targeted `/images` call WITHOUT a language filter (the detail
-  // fetch used `include_image_language=en,null`, which hides non-English
-  // posters). This catches international titles that only have posters in
-  // their original language. Capped at 50 to avoid blowing the TMDB
-  // budget on very sparse catalogs.
+  // --- Phase 5: aggressive poster backfill --------------------------------
+  // Titles that STILL have no poster after the 5-layer chain (detail →
+  // images → season → Watchmode → cast photo) are typically brand-new
+  // TMDB entries with zero art. We throw multiple strategies at them:
+  //
+  //   A. All-language /images call (the detail fetch used en,null filter)
+  //   B. TMDB search-by-title — sometimes a duplicate entry (movie vs TV
+  //      special, different year) has a poster while ours doesn't
+  //   C. Lead cast person images — `/person/{id}/images` can return
+  //      photos that didn't appear in the detail's credits.cast because
+  //      the detail only carries profile_path (the single primary photo)
+  //
+  // Capped at 40 titles to stay within TMDB budget.
   const posterless = deduped.filter((r) => r.posterPath == null);
   if (posterless.length > 0) {
-    const cap = Math.min(posterless.length, 50);
+    const cap = Math.min(posterless.length, 40);
     const toBackfill = posterless.slice(0, cap);
-    const backfillResults = await runWithConcurrency(toBackfill, 15, async (r) => {
+    const backfillResults = await runWithConcurrency(toBackfill, 10, async (r) => {
+      // Strategy A: all-language images
       const endpoint = r.mediaType === "movie"
         ? `/movie/${r.tmdbId}/images`
         : `/tv/${r.tmdbId}/images`;
       try {
-        return await tmdbFetch<TmdbImages>(endpoint, {
-          // No include_image_language — returns ALL languages.
-          params: {},
-        });
-      } catch {
-        return null;
+        const imgs = await tmdbFetch<TmdbImages>(endpoint, { params: {} });
+        const poster = pickPosterFromImages(imgs);
+        if (poster) return { poster, backdrop: pickBackdropFromImages(imgs) };
+        // If images returned backdrops but no posters, keep the backdrop
+        const backdrop = pickBackdropFromImages(imgs);
+        if (backdrop) return { poster: null, backdrop };
+      } catch { /* continue to next strategy */ }
+
+      // Strategy B: search TMDB by baseTitle — a different entry may
+      // have art (e.g. "Trevor Noah: Joy in the Trenches" might exist
+      // as both a movie and a TV special, only one having a poster)
+      try {
+        const searchEndpoint = r.mediaType === "movie" ? "/search/movie" : "/search/tv";
+        const searchRes = await tmdbFetch<{ results: TmdbDiscoverItem[] }>(
+          searchEndpoint,
+          { params: { query: r.baseTitle, language: "en-US", page: 1 } },
+        );
+        for (const hit of searchRes.results ?? []) {
+          if (hit.poster_path) return { poster: hit.poster_path, backdrop: hit.backdrop_path };
+        }
+        // Also try the other media type — a "movie" in our data might
+        // be listed as a TV special in TMDB with art, or vice versa
+        const altEndpoint = r.mediaType === "movie" ? "/search/tv" : "/search/movie";
+        const altRes = await tmdbFetch<{ results: TmdbDiscoverItem[] }>(
+          altEndpoint,
+          { params: { query: r.baseTitle, language: "en-US", page: 1 } },
+        );
+        for (const hit of altRes.results ?? []) {
+          if (hit.poster_path) return { poster: hit.poster_path, backdrop: hit.backdrop_path };
+        }
+      } catch { /* continue */ }
+
+      // Strategy C: lead cast person images (higher-res than the
+      // profile_path we already tried in layer 5)
+      if (r.cast.length > 0) {
+        for (const castMember of r.cast.slice(0, 2)) {
+          try {
+            // castMember doesn't carry the TMDB person id, so search
+            const personRes = await tmdbFetch<{
+              results: Array<{ id: number; profile_path: string | null }>;
+            }>("/search/person", {
+              params: { query: castMember.name, language: "en-US", page: 1 },
+            });
+            const person = personRes.results?.[0];
+            if (person?.profile_path) {
+              return { poster: person.profile_path, backdrop: null };
+            }
+          } catch { /* continue */ }
+        }
       }
+
+      return null;
     });
     for (let i = 0; i < toBackfill.length; i++) {
       const res = backfillResults[i];
       if (res.status !== "fulfilled" || !res.value) continue;
-      const poster = pickPosterFromImages(res.value);
+      const { poster, backdrop } = res.value;
       if (poster) toBackfill[i].posterPath = poster;
-      if (!toBackfill[i].backdropPath) {
-        const backdrop = pickBackdropFromImages(res.value);
-        if (backdrop) toBackfill[i].backdropPath = backdrop;
+      if (backdrop && !toBackfill[i].backdropPath) {
+        toBackfill[i].backdropPath = backdrop;
       }
     }
   }
