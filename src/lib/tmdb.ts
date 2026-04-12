@@ -711,22 +711,66 @@ const ALLOWED_PROVIDER_NAME_BY_ID = new Map<number, string>(
   ALLOWED_PROVIDERS.map((p) => [p.id, p.name]),
 );
 
-/** Hardcoded TMDB logo_path for each allowed provider. Used as a
- *  fallback when a provider is attributed via company/network/SA/
- *  Watchmode but the title hasn't been tagged in TMDB's
- *  `watch/providers` response yet (so `pickProviders` returns nothing
- *  for this provider_id and the logo would otherwise be null, leaving
- *  the UI to render initials like "Ne" or "Di"). These paths are
- *  stable TMDB CDN asset ids. */
-const ALLOWED_PROVIDER_LOGO: Record<number, string> = {
+/** Dynamically fetched TMDB logo_path for each allowed provider.
+ *  Populated once per refresh from TMDB's `/watch/providers/movie`
+ *  endpoint so logos stay current (TMDB changes paths when services
+ *  rebrand — e.g. HBO Max). Falls back to the hardcoded map below if
+ *  the fetch fails. */
+let _providerLogoCache: Record<number, string> | null = null;
+
+/** Last-resort hardcoded logos. Only used when the dynamic fetch
+ *  hasn't run yet or failed entirely. Paths can go stale but are
+ *  better than nothing. */
+const FALLBACK_PROVIDER_LOGO: Record<number, string> = {
   8: "/pbpMk2JmcoNnQwx5JGpXngfoWtp.jpg", // Netflix
   350: "/6uhKBfmtzFqOcLousHwZuzcrScK.jpg", // Apple TV+
   337: "/7rwgEs15tFwyR9NPQ5vpzxTj19Q.jpg", // Disney+
   9: "/emthp39XA2YScoYL1p0sdbAH2WA.jpg", // Amazon Prime Video
   15: "/zxrVdFjIjLqkfnwyghnfywTn3Lh.jpg", // Hulu
   386: "/xTHltMrZPAJFLQ6qyCBjAnXSmZt.jpg", // Peacock
-  1899: "/6Q3KKKLC5RlFhubXgazRgN1a2Jb.jpg", // HBO Max
+  1899: "/fksCUZ9QDWZMUwL2LgMtLckROUN.jpg", // HBO Max
 };
+
+/** Fetch current logo_path for all our providers from TMDB's
+ *  /watch/providers/movie endpoint. Cached so it only runs once per
+ *  serverless cold start. */
+async function fetchProviderLogos(): Promise<Record<number, string>> {
+  if (_providerLogoCache) return _providerLogoCache;
+  try {
+    const res = await tmdbFetch<{
+      results: Array<{
+        provider_id: number;
+        provider_name: string;
+        logo_path: string | null;
+      }>;
+    }>("/watch/providers/movie", {
+      params: { watch_region: "US" },
+      revalidate: 60 * 60 * 24, // 24h cache
+    });
+    const map: Record<number, string> = {};
+    for (const p of res.results ?? []) {
+      if (p.logo_path && ALLOWED_PROVIDER_ID_SET.has(p.provider_id)) {
+        map[p.provider_id] = p.logo_path;
+      }
+    }
+    // Merge fallbacks for any providers not in the API response.
+    for (const [id, path] of Object.entries(FALLBACK_PROVIDER_LOGO)) {
+      if (!map[Number(id)]) map[Number(id)] = path;
+    }
+    _providerLogoCache = map;
+    return map;
+  } catch {
+    // API call failed — fall back to hardcoded.
+    return FALLBACK_PROVIDER_LOGO;
+  }
+}
+
+/** Synchronous accessor that returns whatever logos we've fetched so
+ *  far. If fetchProviderLogos hasn't been called yet, returns the
+ *  hardcoded fallback map. */
+function getProviderLogo(id: number): string | null {
+  return (_providerLogoCache ?? FALLBACK_PROVIDER_LOGO)[id] ?? null;
+}
 
 /** Bounded-concurrency runner so we don't blast TMDB with hundreds of
  *  parallel requests and get rate-limited. */
@@ -1296,6 +1340,10 @@ export async function fetchUpcomingReleasesWithDiagnostics(
     saResult,
     watchmodeResult,
     scraperResult,
+    // Warm the provider-logo cache in parallel with discovery so it's
+    // ready by the time the release-building loop runs. The _result is
+    // unused — fetchProviderLogos writes to _providerLogoCache internally.
+    _providerLogos,
   ] = await Promise.all([
     runWithConcurrency(discoverTasks, 10, (task) => discover(task)),
     includeTv
@@ -1345,6 +1393,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         ],
       }),
     ),
+    fetchProviderLogos().catch(() => FALLBACK_PROVIDER_LOGO),
   ]);
   const saResults = saResult.items;
   const saDiagnostics = saResult.diagnostics;
@@ -1950,7 +1999,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         providerMap.set(p.id, {
           id: p.id,
           name: ALLOWED_PROVIDER_NAME_BY_ID.get(p.id) ?? p.name,
-          logoPath: ALLOWED_PROVIDER_LOGO[p.id] ?? p.logoPath,
+          logoPath: getProviderLogo(p.id) ?? p.logoPath,
         });
       }
     }
@@ -1959,7 +2008,7 @@ export async function fetchUpcomingReleasesWithDiagnostics(
         providerMap.set(id, {
           id,
           name: ALLOWED_PROVIDER_NAME_BY_ID.get(id) ?? `Provider ${id}`,
-          logoPath: ALLOWED_PROVIDER_LOGO[id] ?? null,
+          logoPath: getProviderLogo(id) ?? null,
         });
       }
     }

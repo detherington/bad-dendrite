@@ -77,7 +77,9 @@ export function ReleaseDetailModal({ release, onClose }: Props) {
   }, [onClose]);
 
   const backdrop = tmdbImage(release.backdropPath, "original");
-  const poster = tmdbImage(release.posterPath, "w500");
+  const poster =
+    tmdbImage(release.posterPath, "w500") ??
+    tmdbImage(release.backdropPath, "w500");
   const trailerEmbed = release.trailer
     ? `https://www.youtube.com/embed/${release.trailer.key}`
     : null;

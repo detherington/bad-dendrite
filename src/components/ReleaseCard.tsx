@@ -10,8 +10,17 @@ interface Props {
 }
 
 export function ReleaseCard({ release, onClick, compact = false }: Props) {
-  const poster = tmdbImage(release.posterPath, compact ? "w185" : "w342");
+  const poster =
+    tmdbImage(release.posterPath, compact ? "w185" : "w342") ??
+    tmdbImage(release.backdropPath, compact ? "w185" : "w342");
   const stars = release.cast.slice(0, 3).map((c) => c.name).join(", ");
+  const initials = release.baseTitle
+    .split(/[\s:]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((w) => w[0])
+    .join("")
+    .toUpperCase();
 
   return (
     <button
@@ -29,8 +38,9 @@ export function ReleaseCard({ release, onClick, compact = false }: Props) {
             loading="lazy"
           />
         ) : (
-          <div className="flex h-full w-full items-center justify-center text-[10px] uppercase text-ink-400">
-            No poster
+          <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-gradient-to-b from-ink-700/50 to-ink-800/80">
+            <span className="text-2xl font-bold text-ink-500">{initials}</span>
+            <span className="text-[9px] text-ink-500">{release.mediaType === "movie" ? "Film" : "Series"}</span>
           </div>
         )}
       </div>
