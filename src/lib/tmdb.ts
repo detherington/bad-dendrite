@@ -30,6 +30,7 @@ import type {
   ScraperDiagnostic,
   ScraperResult,
 } from "./scrapers/types";
+import { unstable_cache } from "next/cache";
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 
@@ -1123,10 +1124,33 @@ export async function fetchUpcomingReleases(
   return releases;
 }
 
-/** Full-fat entry point that returns both releases and diagnostics.
- *  /api/releases uses this to expose the diagnostics in the JSON body
- *  so the user can debug SA/TVmaze/TMDB wiring by curling the route. */
-export async function fetchUpcomingReleasesWithDiagnostics(
+/** Cached public entry point. Wraps the uncached orchestrator in
+ *  `unstable_cache` so the full ~20-30s pipeline only runs once per
+ *  `revalidate` window per distinct options-tuple, and every other
+ *  request within that window returns the prebuilt Release[] in
+ *  milliseconds.
+ *
+ *  Cache keying: `unstable_cache` stringifies the opts object and
+ *  includes our `releases-v1` prefix, so different regions /
+ *  movies-only / tv-only / daysAhead combos get their own cache slots.
+ *
+ *  Cache TTL mirrors the Data Cache TTL we already use at the HTTP
+ *  layer (6h). After expiry, stale-while-revalidate semantics serve
+ *  the stale result to the next caller while a background refresh
+ *  runs, so no user ever sees the full 20-30s cold fetch after the
+ *  initial deploy. */
+export const fetchUpcomingReleasesWithDiagnostics = unstable_cache(
+  async (
+    opts: FetchReleasesOptions = {},
+  ): Promise<FetchUpcomingReleasesResult> =>
+    fetchUpcomingReleasesWithDiagnosticsUncached(opts),
+  ["releases-v1"],
+  { revalidate: 60 * 60 * 6, tags: ["releases"] },
+);
+
+/** Uncached orchestrator. Don't call directly from callers — always
+ *  go through the cached wrapper above. */
+async function fetchUpcomingReleasesWithDiagnosticsUncached(
   opts: FetchReleasesOptions = {},
 ): Promise<FetchUpcomingReleasesResult> {
   const region = (opts.region || getRegion()).toUpperCase();

@@ -4,14 +4,12 @@ import { fetchUpcomingReleases, getRegion, TmdbConfigError } from "@/lib/tmdb";
 import type { ReleasesResponse } from "@/lib/types";
 
 // Don't prerender at build time (avoids build failure when TMDB env vars are
-// absent locally). At request time, the underlying TMDB fetches in
-// `src/lib/tmdb.ts` are cached via the Next.js Data Cache for 6 hours, so
-// Vercel won't hammer TMDB on every request.
+// absent locally). The data fetch itself is wrapped in `unstable_cache` (6h
+// TTL) at the tmdb.ts layer, so only the first request after expiry pays
+// the full ~20-30s pipeline cost — every subsequent request serves a
+// prebuilt Release[] in milliseconds. Stale-while-revalidate semantics
+// ensure no user ever sees the full cold fetch after the initial deploy.
 export const dynamic = "force-dynamic";
-// Cold fetches touch TMDB (~650 calls), TVmaze (~90), and Streaming
-// Availability (~42), which sum to ~20-30s even with concurrency caps
-// and parallel phases. The Vercel Hobby default function timeout is 10s,
-// which was killing cold fetches. Bump to the Hobby max (60s).
 export const maxDuration = 60;
 
 async function loadReleases(): Promise<
@@ -32,14 +30,11 @@ async function loadReleases(): Promise<
   }
 }
 
-export default async function Page({
-  searchParams,
-}: {
-  searchParams?: { r?: string | string[] };
-}) {
+/** Server component that awaits the data fetch. Kept in a separate
+ *  component so the outer Page can render a loading skeleton via
+ *  Suspense while this streams in. */
+async function ReleasesData({ initialSelectedId }: { initialSelectedId?: string }) {
   const result = await loadReleases();
-  const rawR = searchParams?.r;
-  const initialSelectedId = Array.isArray(rawR) ? rawR[0] : rawR;
 
   if (!result.ok) {
     return (
@@ -81,9 +76,58 @@ export default async function Page({
     );
   }
 
+  return <ReleasesApp initial={result.data} initialSelectedId={initialSelectedId} />;
+}
+
+/** Skeleton shown while ReleasesData streams in. Matches the real
+ *  layout so the page shell doesn't shift when data lands. */
+function ReleasesLoading() {
   return (
-    <Suspense>
-      <ReleasesApp initial={result.data} initialSelectedId={initialSelectedId} />
+    <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+      <div className="mb-6 flex items-center justify-between">
+        <h1 className="text-2xl font-semibold text-ink-50 sm:text-3xl">Streaming Releases</h1>
+        <div className="h-8 w-32 animate-pulse rounded-full bg-ink-800" />
+      </div>
+      <div className="mb-6 h-28 animate-pulse rounded-2xl bg-ink-900" />
+      <div className="mb-4 flex gap-2">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="h-8 w-20 animate-pulse rounded-full bg-ink-800" />
+        ))}
+      </div>
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div
+            key={i}
+            className="flex gap-4 rounded-xl border border-ink-800 bg-ink-900/60 p-3"
+          >
+            <div className="h-[132px] w-[88px] shrink-0 animate-pulse rounded-md bg-ink-800" />
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              <div className="h-5 w-3/4 animate-pulse rounded bg-ink-800" />
+              <div className="h-3 w-1/2 animate-pulse rounded bg-ink-800" />
+              <div className="h-3 w-2/3 animate-pulse rounded bg-ink-800" />
+              <div className="mt-auto h-6 w-20 animate-pulse rounded bg-ink-800" />
+            </div>
+          </div>
+        ))}
+      </div>
+      <p className="mt-6 text-center text-xs text-ink-500">
+        Fetching upcoming releases&hellip;
+      </p>
+    </main>
+  );
+}
+
+export default function Page({
+  searchParams,
+}: {
+  searchParams?: { r?: string | string[] };
+}) {
+  const rawR = searchParams?.r;
+  const initialSelectedId = Array.isArray(rawR) ? rawR[0] : rawR;
+
+  return (
+    <Suspense fallback={<ReleasesLoading />}>
+      <ReleasesData initialSelectedId={initialSelectedId} />
     </Suspense>
   );
 }
